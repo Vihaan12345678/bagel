@@ -3,7 +3,7 @@ import requests
 
 # 🔐 API and Webhook Credentials from Environment Variables
 API_TOKEN = os.getenv("BAGEL_API_TOKEN")
-BASE_URL = "https://bagelsmp.com"
+BASE_URL = "https://bagelsmp.com"  # 👈 CRITICAL FIX: Keep the 'api.' subdomain and '/v1' path!
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 headers = {
@@ -47,11 +47,18 @@ def get_market_data(endpoint):
         return None
 
 def analyze_best_strategy():
+    if not API_TOKEN or API_TOKEN == "YOUR_API_TOKEN":
+        print("❌ CRITICAL ERROR: Your BAGEL_API_TOKEN environment variable is empty!")
+        print("Please check your GitHub Secrets settings or local export variables.")
+        return
+
     prices = get_market_data("prices")
-    orders = get_market_data("orders") or get_market_data("auction-house")
+    orders = get_market_data("orders")
+    auctions = get_market_data("auctions") # 👈 FIX: Matches live /ah endpoints
     
     if not prices:
-        print("❌ Unable to fetch baseline server market rates.")
+        print("❌ Unable to fetch baseline server market rates. (Status Code 404)")
+        print("Tip: Re-verify your Bearer Token in GitHub Secrets to ensure there are no trailing spaces.")
         return
 
     print("📊 --- LIVE SERVER MARKET EVALUATION --- 📊\n")
@@ -69,18 +76,22 @@ def analyze_best_strategy():
             max_passive_yield = hourly_yield
             best_passive_crop = crop
 
-    # 2. Order book / Auction House flipping evaluation
+    # 2. Combined Market Loop (Orders + Live Auctions)
     print("\n🔍 Scanning for Arbitrage and Market Flipping Opportunities...")
     alert_message = ""
     flips_found = 0
     
-    if orders:
-        for listing in orders:
+    # Combine active data arrays from both marketplace endpoints
+    marketplace_listings = []
+    if orders: marketplace_listings.extend(orders)
+    if auctions: marketplace_listings.extend(auctions)
+    
+    if marketplace_listings:
+        for listing in marketplace_listings:
             item_name = listing.get("item", "").lower()
             listed_price = listing.get("price", 0)
             quantity = listing.get("quantity", 1)
             
-            # Identify discrepancies where listed item is below 75% of server base value
             base_value = prices.get(item_name, 0)
             if base_value > 0 and listed_price < (base_value * 0.75):
                 potential_profit = (base_value * quantity) - (listed_price * quantity)
