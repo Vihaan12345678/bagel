@@ -1,6 +1,7 @@
 import os
 import requests
 
+# 🔐 API Credentials from GitHub Secrets / Linux Environment Variables
 API_TOKEN = os.getenv("BAGEL_API_TOKEN", "").strip()
 BASE_URL = "https://bagelsmp.com"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -10,7 +11,7 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# 🛠️ Define Minecraft Crafting Recipes & Material Requirements
+# 🛠️ Minecraft Crafting Recipes & Material Requirements
 CRAFTING_RECIPES = {
     "diamond_sword":   {"diamond": 2, "stick": 1},
     "diamond_axe":     {"diamond": 3, "stick": 2},
@@ -25,14 +26,20 @@ CRAFTING_RECIPES = {
 }
 
 def send_alert(message):
+    """Sends a mobile push notification alert via your Discord Webhook."""
     if DISCORD_WEBHOOK_URL:
         try:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
-            print("✅ Mobile alert sent successfully!")
+            payload = {"content": message}
+            response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+            if response.status_code == 204:
+                print("✅ Mobile alert sent successfully!")
+            else:
+                print(f"⚠️ Discord Webhook returned status code: {response.status_code}")
         except Exception as e:
             print(f"❌ Failed to send Discord notification: {e}")
 
 def get_market_data(endpoint):
+    """Fetches target market data array from the server endpoint."""
     url = f"{BASE_URL}/{endpoint}"
     try:
         response = requests.get(url, headers=headers)
@@ -47,7 +54,7 @@ def analyze_best_strategy():
         print("❌ CRITICAL ERROR: Your BAGEL_API_TOKEN environment variable is empty!")
         return
 
-    print("📊 --- BAGEL SMP MULTI-MARKET ARBITRAGE SYSTEM --- 📊\n")
+    print("📊 --- BAGEL SMP LOW-MARGIN ARBITRAGE SYSTEM --- 📊\n")
     
     prices = get_market_data("prices") or {}
     orders = get_market_data("orders") or []
@@ -61,7 +68,6 @@ def analyze_best_strategy():
     # -------------------------------------------------------------------------
     print("🔍 Scanning for Direct Order-to-Auction House Flips...")
     
-    # Map out the cheapest buying option from orders
     cheapest_orders = {}
     for o in orders:
         item = o.get("item", "").lower()
@@ -74,30 +80,27 @@ def analyze_best_strategy():
         ah_listed_price = a.get("price", 0)
         quantity = a.get("quantity", 1)
         
-        # If the item can be acquired from orders cheaper than it sells on AH
         if item_name in cheapest_orders:
             order_cost = cheapest_orders[item_name] * quantity
-            if ah_listed_price > (order_cost * 1.25):  # 25%+ Profit Margin
+            # 📉 LOWER THRESHOLD: Triggers at a 15%+ profit margin instead of 25%
+            if ah_listed_price > (order_cost * 1.15):  
                 net_profit = ah_listed_price - order_cost
-                msg = f"🔄 [DIRECT FLIP] Buy {quantity}x {item_name.upper()} from Orders for {order_cost} & Sell on AH for {ah_listed_price}! Net Profit: +{net_profit} coins.\n"
+                msg = f"🔄 [DIRECT FLIP] Buy {quantity}x {item_name.upper()} from Orders ({order_cost}) & Sell on AH ({ah_listed_price})! Profit: +{net_profit} coins.\n"
                 print(msg.strip())
                 alert_message += msg
                 opportunities_count += 1
 
     # -------------------------------------------------------------------------
-    # ⚔️ STEP 2: Crafting Arbitrage (Swords, Axes, Gear)
+    # ⚔️ STEP 2: Crafting Arbitrage (Weapons & Gear)
     # -------------------------------------------------------------------------
     print("\n🔨 Analyzing Crafting Profit Margins for Weapons & Armor...")
     
-    # Calculate the raw material costs using current order pricing
-    # Standard fallback prices applied if order book lacks raw items
     material_costs = {
         "diamond": cheapest_orders.get("diamond", prices.get("diamond", 200)),
         "iron_ingot": cheapest_orders.get("iron_ingot", prices.get("iron_ingot", 30)),
         "stick": cheapest_orders.get("stick", prices.get("stick", 1))
     }
 
-    # Map out active prices on the auction house to verify standard gear value
     highest_ah_gear = {}
     for a in auctions:
         item = a.get("item", "").lower()
@@ -106,19 +109,17 @@ def analyze_best_strategy():
             if item not in highest_ah_gear or price > highest_ah_gear[item]:
                 highest_ah_gear[item] = price
 
-    # Calculate profit metrics for each recipe
     for gear_item, ingredients in CRAFTING_RECIPES.items():
-        # Compute the cost to craft the gear piece
         crafting_cost = 0
         for mat, count in ingredients.items():
             crafting_cost += material_costs.get(mat, 999999) * count
         
-        # Check if players are listing this completed gear on AH for more than the cost to make it
         market_value = highest_ah_gear.get(gear_item, prices.get(gear_item, 0))
         
-        if market_value > (crafting_cost * 1.30): # 30%+ profit matrix check
+        # 📉 LOWER THRESHOLD: Triggers at a 10%+ profit margin instead of 30%
+        if market_value > (crafting_cost * 1.10): 
             profit = market_value - crafting_cost
-            msg = f"⚒️ [CRAFTING PROFIT] Craft {gear_item.upper()}! Material Cost: {crafting_cost} coins ➔ Sells on AH for ~{market_value} coins! Profit per item: +{profit} coins.\n"
+            msg = f"⚒️ [CRAFTING PROFIT] Craft {gear_item.upper()}! Material Cost: {crafting_cost} ➔ AH Value: ~{market_value}! Profit: +{profit} coins.\n"
             print(msg.strip())
             alert_message += msg
             opportunities_count += 1
@@ -128,14 +129,10 @@ def analyze_best_strategy():
     # -------------------------------------------------------------------------
     print("\n🏆 --- RECOMMENDED ACTION --- 🏆")
     if opportunities_count > 0:
-        print("🎯 Opportunities detected! Review the targets above and log into the server to execute.")
-        send_alert(f"💰 **Bagel SMP Arbitrage Report!**\n{alert_message}")
+        print("🎯 Small-margin deals detected! Sending to Discord...")
+        send_alert(f"📉 **Bagel SMP Low-Margin Arbitrage Report!**\n{alert_message}")
     else:
-        print("🚜 Markets are currently aligned perfectly. Maintain your passive crop farming lines.")
+        print("🚜 No deals found crossing the 10% profit margin line right now.")
 
 if __name__ == "__main__":
-    # Add this temporary line right here to test your connection:
-    send_alert("🔔 System Check: The market scanner is connected to Discord successfully!")
-    
     analyze_best_strategy()
-
