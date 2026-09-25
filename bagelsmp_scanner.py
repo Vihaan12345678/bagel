@@ -135,4 +135,8 @@ def analyze_best_strategy():
         print("🚜 No deals found crossing the 10% profit margin line right now.")
 
 if __name__ == "__main__":
+    # Add this temporary line right here to test your connection:
+    send_alert("🔔 System Check: The market scanner is connected to Discord successfully!")
+    
     analyze_best_strategy()
+
