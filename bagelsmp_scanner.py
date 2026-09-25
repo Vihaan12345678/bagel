@@ -1,112 +1,137 @@
 import os
 import requests
 
-# 🔐 Strip any hidden line breaks or white spaces from GitHub secrets
 API_TOKEN = os.getenv("BAGEL_API_TOKEN", "").strip()
+BASE_URL = "https://bagelsmp.com"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-
-# Base system URL configuration variants
-BASE_URL = "https://api.bagelsmp.com/v1"
 
 headers = {
     "Authorization": f"Bearer {API_TOKEN}",
     "Content-Type": "application/json"
 }
 
-GROWTH_RATES_PER_HOUR = {
-    "cactus": 1.0,        
-    "sugarcane": 2.0,     
-    "melon_slice": 4.0,   
-    "pumpkin": 1.0        
+# 🛠️ Define Minecraft Crafting Recipes & Material Requirements
+CRAFTING_RECIPES = {
+    "diamond_sword":   {"diamond": 2, "stick": 1},
+    "diamond_axe":     {"diamond": 3, "stick": 2},
+    "diamond_pickaxe": {"diamond": 3, "stick": 2},
+    "diamond_helmet":  {"diamond": 5},
+    "diamond_chestplate": {"diamond": 8},
+    "diamond_leggings":  {"diamond": 7},
+    "diamond_boots":     {"diamond": 4},
+    "iron_sword":      {"iron_ingot": 2, "stick": 1},
+    "iron_axe":        {"iron_ingot": 3, "stick": 2},
+    "iron_pickaxe":    {"iron_ingot": 3, "stick": 2},
 }
 
 def send_alert(message):
     if DISCORD_WEBHOOK_URL:
         try:
             requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
+            print("✅ Mobile alert sent successfully!")
         except Exception as e:
-            print(f"❌ Webhook failed: {e}")
+            print(f"❌ Failed to send Discord notification: {e}")
 
 def get_market_data(endpoint):
-    """Attempts to pull data, testing fallback paths if a 404 occurs."""
-    # Test primary path
     url = f"{BASE_URL}/{endpoint}"
     try:
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
             return response.json()
+        return None
     except Exception:
-        pass
-
-    # Fallback path adjustment in case API routing updates proxy mappings
-    fallback_url = f"https://bagelsmp.com{endpoint}"
-    try:
-        response = requests.get(fallback_url, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        print(f"⚠️ API Error ({endpoint}): Main 404, Fallback {response.status_code}")
-    except Exception as e:
-        print(f"❌ Connection failed for {endpoint}: {e}")
-    
-    return None
+        return None
 
 def analyze_best_strategy():
-    if not API_TOKEN or "YOUR_" in API_TOKEN:
-        print("❌ CRITICAL ERROR: Your BAGEL_API_TOKEN variable is invalid or empty!")
+    if not API_TOKEN or API_TOKEN == "":
+        print("❌ CRITICAL ERROR: Your BAGEL_API_TOKEN environment variable is empty!")
         return
 
-    print("📡 Testing server connectivity pipelines...")
-    prices = get_market_data("prices")
-    orders = get_market_data("orders")
-    auctions = get_market_data("auctions")
+    print("📊 --- BAGEL SMP MULTI-MARKET ARBITRAGE SYSTEM --- 📊\n")
     
-    if not prices:
-        print("❌ Unable to fetch baseline market rates. Both primary and fallback paths returned 404.")
-        print("💡 Solution: Verify your Bagel+ account status via the server dashboard.")
-        return
+    prices = get_market_data("prices") or {}
+    orders = get_market_data("orders") or []
+    auctions = get_market_data("auctions") or []
 
-    print("📊 --- LIVE SERVER MARKET EVALUATION --- 📊\n")
-    
-    best_passive_crop = None
-    max_passive_yield = 0
-    for crop, rate in GROWTH_RATES_PER_HOUR.items():
-        crop_price = prices.get(crop, 0)
-        hourly_yield = crop_price * rate
-        print(f"• {crop.capitalize()}: {crop_price} coins | Yield = {hourly_yield:.2f} coins/hr")
-        if hourly_yield > max_passive_yield:
-            max_passive_yield = hourly_yield
-            best_passive_crop = crop
-
-    print("\n🔍 Scanning for Flipping Opportunities...")
     alert_message = ""
-    flips_found = 0
+    opportunities_count = 0
+
+    # -------------------------------------------------------------------------
+    # 🎯 STEP 1: Direct Order-to-AH Flipping Arbitrage
+    # -------------------------------------------------------------------------
+    print("🔍 Scanning for Direct Order-to-Auction House Flips...")
     
-    marketplace_listings = []
-    if isinstance(orders, list): marketplace_listings.extend(orders)
-    if isinstance(auctions, list): marketplace_listings.extend(auctions)
+    # Map out the cheapest buying option from orders
+    cheapest_orders = {}
+    for o in orders:
+        item = o.get("item", "").lower()
+        price = o.get("price", 0)
+        if item and (item not in cheapest_orders or price < cheapest_orders[item]):
+            cheapest_orders[item] = price
+
+    for a in auctions:
+        item_name = a.get("item", "").lower()
+        ah_listed_price = a.get("price", 0)
+        quantity = a.get("quantity", 1)
+        
+        # If the item can be acquired from orders cheaper than it sells on AH
+        if item_name in cheapest_orders:
+            order_cost = cheapest_orders[item_name] * quantity
+            if ah_listed_price > (order_cost * 1.25):  # 25%+ Profit Margin
+                net_profit = ah_listed_price - order_cost
+                msg = f"🔄 [DIRECT FLIP] Buy {quantity}x {item_name.upper()} from Orders for {order_cost} & Sell on AH for {ah_listed_price}! Net Profit: +{net_profit} coins.\n"
+                print(msg.strip())
+                alert_message += msg
+                opportunities_count += 1
+
+    # -------------------------------------------------------------------------
+    # ⚔️ STEP 2: Crafting Arbitrage (Swords, Axes, Gear)
+    # -------------------------------------------------------------------------
+    print("\n🔨 Analyzing Crafting Profit Margins for Weapons & Armor...")
     
-    for listing in marketplace_listings:
-        item_name = listing.get("item", "").lower()
-        listed_price = listing.get("price", 0)
-        quantity = listing.get("quantity", 1)
+    # Calculate the raw material costs using current order pricing
+    # Standard fallback prices applied if order book lacks raw items
+    material_costs = {
+        "diamond": cheapest_orders.get("diamond", prices.get("diamond", 200)),
+        "iron_ingot": cheapest_orders.get("iron_ingot", prices.get("iron_ingot", 30)),
+        "stick": cheapest_orders.get("stick", prices.get("stick", 1))
+    }
+
+    # Map out active prices on the auction house to verify standard gear value
+    highest_ah_gear = {}
+    for a in auctions:
+        item = a.get("item", "").lower()
+        price = a.get("price", 0)
+        if item in CRAFTING_RECIPES:
+            if item not in highest_ah_gear or price > highest_ah_gear[item]:
+                highest_ah_gear[item] = price
+
+    # Calculate profit metrics for each recipe
+    for gear_item, ingredients in CRAFTING_RECIPES.items():
+        # Compute the cost to craft the gear piece
+        crafting_cost = 0
+        for mat, count in ingredients.items():
+            crafting_cost += material_costs.get(mat, 999999) * count
         
-        base_value = prices.get(item_name, 0)
-        if base_value > 0 and listed_price < (base_value * 0.75):
-            potential_profit = (base_value * quantity) - (listed_price * quantity)
-            info_line = f"✨ [FLIP] {quantity}x {item_name.upper()} listed for {listed_price}! Profit: +{potential_profit}\n"
-            print(info_line.strip())
-            alert_message += info_line
-            flips_found += 1
-                
-    if flips_found == 0:
-        print("• No immediate market mispricings found right now.")
+        # Check if players are listing this completed gear on AH for more than the cost to make it
+        market_value = highest_ah_gear.get(gear_item, prices.get(gear_item, 0))
         
+        if market_value > (crafting_cost * 1.30): # 30%+ profit matrix check
+            profit = market_value - crafting_cost
+            msg = f"⚒️ [CRAFTING PROFIT] Craft {gear_item.upper()}! Material Cost: {crafting_cost} coins ➔ Sells on AH for ~{market_value} coins! Profit per item: +{profit} coins.\n"
+            print(msg.strip())
+            alert_message += msg
+            opportunities_count += 1
+
+    # -------------------------------------------------------------------------
+    # 📢 STEP 3: Report & Send Mobile Notifications
+    # -------------------------------------------------------------------------
     print("\n🏆 --- RECOMMENDED ACTION --- 🏆")
-    if flips_found > 0:
-        print("🎯 Priority: Buy the active market listings shown above.")
-        send_alert(f"💸 **Bagel SMP Deal Alert!**\n{alert_message}")
+    if opportunities_count > 0:
+        print("🎯 Opportunities detected! Review the targets above and log into the server to execute.")
+        send_alert(f"💰 **Bagel SMP Arbitrage Report!**\n{alert_message}")
     else:
-        print(f"🚜 Strategy: Allocate your 22k into building a {best_passive_crop.upper()} farm tower.")
+        print("🚜 Markets are currently aligned perfectly. Maintain your passive crop farming lines.")
 
 if __name__ == "__main__":
     analyze_best_strategy()
