@@ -134,4 +134,8 @@ def analyze_best_strategy():
         print("🚜 Markets are currently aligned perfectly. Maintain your passive crop farming lines.")
 
 if __name__ == "__main__":
+    # Add this temporary line right here to test your connection:
+    send_alert("🔔 System Check: The market scanner is connected to Discord successfully!")
+    
     analyze_best_strategy()
+
