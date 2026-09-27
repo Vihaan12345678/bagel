@@ -54,7 +54,7 @@ def analyze_best_strategy():
         print("❌ CRITICAL ERROR: Your BAGEL_API_TOKEN environment variable is empty!")
         return
 
-    print("📊 --- BAGEL SMP LOW-MARGIN ARBITRAGE SYSTEM --- 📊\n")
+    print("📊 --- BAGEL SMP HYPER-SENSITIVE 5% ENGINE --- 📊\n")
     
     prices = get_market_data("prices") or {}
     orders = get_market_data("orders") or []
@@ -66,8 +66,6 @@ def analyze_best_strategy():
     # -------------------------------------------------------------------------
     # 🎯 STEP 1: Direct Order-to-AH Flipping Arbitrage
     # -------------------------------------------------------------------------
-    print("🔍 Scanning for Direct Order-to-Auction House Flips...")
-    
     cheapest_orders = {}
     for o in orders:
         item = o.get("item", "").lower()
@@ -82,19 +80,15 @@ def analyze_best_strategy():
         
         if item_name in cheapest_orders:
             order_cost = cheapest_orders[item_name] * quantity
-            # 📉 LOWER THRESHOLD: Triggers at a 15%+ profit margin instead of 25%
-            if ah_listed_price > (order_cost * 1.15):  
+            if ah_listed_price > (order_cost * 1.05):  
                 net_profit = ah_listed_price - order_cost
-                msg = f"🔄 [DIRECT FLIP] Buy {quantity}x {item_name.upper()} from Orders ({order_cost}) & Sell on AH ({ah_listed_price})! Profit: +{net_profit} coins.\n"
-                print(msg.strip())
+                msg = f"🔄 [ORDER -> AH FLIP] Buy {quantity}x {item_name.upper()} from Orders ({order_cost}) & Sell on AH ({ah_listed_price})! Profit: +{net_profit} coins.\n"
                 alert_message += msg
                 opportunities_count += 1
 
     # -------------------------------------------------------------------------
     # ⚔️ STEP 2: Crafting Arbitrage (Weapons & Gear)
     # -------------------------------------------------------------------------
-    print("\n🔨 Analyzing Crafting Profit Margins for Weapons & Armor...")
-    
     material_costs = {
         "diamond": cheapest_orders.get("diamond", prices.get("diamond", 200)),
         "iron_ingot": cheapest_orders.get("iron_ingot", prices.get("iron_ingot", 30)),
@@ -116,27 +110,52 @@ def analyze_best_strategy():
         
         market_value = highest_ah_gear.get(gear_item, prices.get(gear_item, 0))
         
-        # 📉 LOWER THRESHOLD: Triggers at a 10%+ profit margin instead of 30%
-        if market_value > (crafting_cost * 1.10): 
+        if market_value > (crafting_cost * 1.05): 
             profit = market_value - crafting_cost
             msg = f"⚒️ [CRAFTING PROFIT] Craft {gear_item.upper()}! Material Cost: {crafting_cost} ➔ AH Value: ~{market_value}! Profit: +{profit} coins.\n"
-            print(msg.strip())
             alert_message += msg
             opportunities_count += 1
 
     # -------------------------------------------------------------------------
-    # 📢 STEP 3: Report & Send Mobile Notifications
+    # ⚖️ STEP 3: Pure AH-to-AH Flipping (Reselling within /ah)
     # -------------------------------------------------------------------------
-    print("\n🏆 --- RECOMMENDED ACTION --- 🏆")
+    items_by_group = {}
+    for a in auctions:
+        item_name = a.get("item", "").lower()
+        price = a.get("price", 0)
+        quantity = a.get("quantity", 1)
+        if quantity > 0 and price > 0:
+            price_per_unit = price / quantity
+            if item_name not in items_by_group:
+                items_by_group[item_name] = []
+            items_by_group[item_name].append({"total_price": price, "unit_price": price_per_unit, "qty": quantity})
+
+    for item_name, listings in items_by_group.items():
+        if len(listings) < 2:
+            continue  
+            
+        listings.sort(key=lambda x: x["unit_price"])
+        
+        cheapest = listings[0]
+        next_cheapest = listings[1]
+        
+        potential_resell_value = next_cheapest["unit_price"] * cheapest["qty"]
+        if potential_resell_value > (cheapest["total_price"] * 1.05):
+            profit = potential_resell_value - cheapest["total_price"]
+            msg = f"⚖️ [AH -> AH FLIP] Buy cheap listing of {cheapest['qty']}x {item_name.upper()} for {cheapest['total_price']} total. Next unit price is higher! Resell for ~{int(potential_resell_value)}. Profit: +{int(profit)} coins.\n"
+            alert_message += msg
+            opportunities_count += 1
+
+    # -------------------------------------------------------------------------
+    # 📢 STEP 4: Report Status
+    # -------------------------------------------------------------------------
     if opportunities_count > 0:
-        print("🎯 Small-margin deals detected! Sending to Discord...")
-        send_alert(f"📉 **Bagel SMP Low-Margin Arbitrage Report!**\n{alert_message}")
+        send_alert(f"🔥 **Bagel SMP 5% Deal Found!**\n{alert_message}")
     else:
-        print("🚜 No deals found crossing the 10% profit margin line right now.")
+        send_alert("🟢 **Scanner Heartbeat:** Checked markets. No deals crossing the 5% margin right now.")
 
 if __name__ == "__main__":
-    # Add this temporary line right here to test your connection:
-    send_alert("🔔 System Check: The market scanner is connected to Discord successfully!")
+    # 🛫 STARTUP PROMPT: Sends a message to Discord the exact millisecond the script fires up
+    send_alert("🚀 **Scanner Initialized:** Connecting to Bagel SMP database pipeline...")
     
     analyze_best_strategy()
-
