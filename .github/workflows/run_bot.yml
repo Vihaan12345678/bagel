@@ -2,9 +2,9 @@ name: Bagel SMP Market Scanner
 
 on:
   schedule:
-    # Trigger automatically every 5 minutes 24/7
-    - cron: '*/5 * * * *'
-  workflow_dispatch: # Allows you to manually trigger a scan anytime via GitHub UI
+    # Safely wakes up a new background script container every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allows you to instantly fire the loop yourself via Actions UI
 
 jobs:
   scan:
@@ -22,8 +22,8 @@ jobs:
         run: |
           pip install requests
 
-      - name: Execute Live Market Scan
+      - name: Execute Live Loop Market Scan
         env:
           BAGEL_API_TOKEN: ${{ secrets.BAGEL_API_TOKEN }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python bagelsmp_scanner.py
+        run: python bagelsmp_scanner.py --loop
