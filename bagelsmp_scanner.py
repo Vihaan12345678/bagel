@@ -54,7 +54,7 @@ def analyze_best_strategy():
         print("❌ CRITICAL ERROR: Your BAGEL_API_TOKEN environment variable is empty!")
         return
 
-    print("📊 --- BAGEL SMP HYPER-SENSITIVE 5% ENGINE --- 📊\n")
+    print("📊 --- BAGEL SMP SELLER-TRACKING ENGINE --- 📊\n")
     
     prices = get_market_data("prices") or {}
     orders = get_market_data("orders") or []
@@ -67,22 +67,27 @@ def analyze_best_strategy():
     # 🎯 STEP 1: Direct Order-to-AH Flipping Arbitrage
     # -------------------------------------------------------------------------
     cheapest_orders = {}
+    order_sellers = {}
     for o in orders:
         item = o.get("item", "").lower()
         price = o.get("price", 0)
+        seller = o.get("seller") or o.get("username") or o.get("owner") or "Unknown Player"
         if item and (item not in cheapest_orders or price < cheapest_orders[item]):
             cheapest_orders[item] = price
+            order_sellers[item] = seller
 
     for a in auctions:
         item_name = a.get("item", "").lower()
         ah_listed_price = a.get("price", 0)
         quantity = a.get("quantity", 1)
+        ah_seller = a.get("seller") or a.get("username") or a.get("owner") or "Unknown Player"
         
         if item_name in cheapest_orders:
             order_cost = cheapest_orders[item_name] * quantity
             if ah_listed_price > (order_cost * 1.05):  
                 net_profit = ah_listed_price - order_cost
-                msg = f"🔄 [ORDER -> AH FLIP] Buy {quantity}x {item_name.upper()} from Orders ({order_cost}) & Sell on AH ({ah_listed_price})! Profit: +{net_profit} coins.\n"
+                order_seller = order_sellers[item_name]
+                msg = f"🔄 **[ORDER -> AH FLIP]**\n👉 **{order_seller}** has an active sell order for {quantity}x {item_name.upper()} at {cheapest_orders[item_name]} each.\n💰 *Action:* Buy it from orders for {order_cost} total, then resell it on `/ah` for {ah_listed_price}! **Net Profit: +{net_profit} coins.**\n\n"
                 alert_message += msg
                 opportunities_count += 1
 
@@ -112,7 +117,13 @@ def analyze_best_strategy():
         
         if market_value > (crafting_cost * 1.05): 
             profit = market_value - crafting_cost
-            msg = f"⚒️ [CRAFTING PROFIT] Craft {gear_item.upper()}! Material Cost: {crafting_cost} ➔ AH Value: ~{market_value}! Profit: +{profit} coins.\n"
+            mat_sources = []
+            for mat in ingredients.keys():
+                src = order_sellers.get(mat, "the market")
+                mat_sources.append(f"{mat} from {src}")
+            mats_str = ", ".join(mat_sources)
+            
+            msg = f"⚒️ **[CRAFTING OPPORTUNITY]**\n👉 You can order materials ({mats_str}) for a total crafting cost of {crafting_cost} coins.\n💰 *Action:* Craft a {gear_item.upper()} and list it on `/ah` for ~{market_value} coins! **Net Profit: +{profit} coins per item.**\n\n"
             alert_message += msg
             opportunities_count += 1
 
@@ -124,11 +135,17 @@ def analyze_best_strategy():
         item_name = a.get("item", "").lower()
         price = a.get("price", 0)
         quantity = a.get("quantity", 1)
+        seller = a.get("seller") or a.get("username") or a.get("owner") or "Unknown Player"
         if quantity > 0 and price > 0:
             price_per_unit = price / quantity
             if item_name not in items_by_group:
                 items_by_group[item_name] = []
-            items_by_group[item_name].append({"total_price": price, "unit_price": price_per_unit, "qty": quantity})
+            items_by_group[item_name].append({
+                "total_price": price, 
+                "unit_price": price_per_unit, 
+                "qty": quantity,
+                "seller": seller
+            })
 
     for item_name, listings in items_by_group.items():
         if len(listings) < 2:
@@ -142,7 +159,7 @@ def analyze_best_strategy():
         potential_resell_value = next_cheapest["unit_price"] * cheapest["qty"]
         if potential_resell_value > (cheapest["total_price"] * 1.05):
             profit = potential_resell_value - cheapest["total_price"]
-            msg = f"⚖️ [AH -> AH FLIP] Buy cheap listing of {cheapest['qty']}x {item_name.upper()} for {cheapest['total_price']} total. Next unit price is higher! Resell for ~{int(potential_resell_value)}. Profit: +{int(profit)} coins.\n"
+            msg = f"⚖️ **[AH -> AH RESELL FLIP]**\n👉 **{cheapest['seller']}** mispriced a listing of {cheapest['qty']}x {item_name.upper()} for only {cheapest['total_price']} total coins!\n💰 *Action:* Buy it instantly from `/ah` and resell it at the standard unit price for ~{int(potential_resell_value)} coins! **Net Profit: +{int(profit)} coins.**\n\n"
             alert_message += msg
             opportunities_count += 1
 
@@ -150,12 +167,10 @@ def analyze_best_strategy():
     # 📢 STEP 4: Report Status
     # -------------------------------------------------------------------------
     if opportunities_count > 0:
-        send_alert(f"🔥 **Bagel SMP 5% Deal Found!**\n{alert_message}")
+        send_alert(f"🔥 **Bagel SMP 5% Arbitrage Alert!**\n\n{alert_message}")
     else:
         send_alert("🟢 **Scanner Heartbeat:** Checked markets. No deals crossing the 5% margin right now.")
 
 if __name__ == "__main__":
-    # 🛫 STARTUP PROMPT: Sends a message to Discord the exact millisecond the script fires up
     send_alert("🚀 **Scanner Initialized:** Connecting to Bagel SMP database pipeline...")
-    
     analyze_best_strategy()
