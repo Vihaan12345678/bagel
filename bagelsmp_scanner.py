@@ -1,9 +1,11 @@
 import os
+import sys
+import time
 import requests
 
 # 🔐 API Credentials from GitHub Secrets / Linux Environment Variables
 API_TOKEN = os.getenv("BAGEL_API_TOKEN", "").strip()
-BASE_URL = "https://bagelsmp.com"
+BASE_URL = "https://api.bagelsmp.com/v1"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 headers = {
@@ -54,7 +56,7 @@ def analyze_best_strategy():
         print("❌ CRITICAL ERROR: Your BAGEL_API_TOKEN environment variable is empty!")
         return
 
-    print("📊 --- BAGEL SMP SELLER-TRACKING ENGINE --- 📊\n")
+    print("📊 --- BAGEL SMP SELLER-TRACKING ENGINE (5%) --- 📊\n")
     
     prices = get_market_data("prices") or {}
     orders = get_market_data("orders") or []
@@ -80,7 +82,6 @@ def analyze_best_strategy():
         item_name = a.get("item", "").lower()
         ah_listed_price = a.get("price", 0)
         quantity = a.get("quantity", 1)
-        ah_seller = a.get("seller") or a.get("username") or a.get("owner") or "Unknown Player"
         
         if item_name in cheapest_orders:
             order_cost = cheapest_orders[item_name] * quantity
@@ -172,5 +173,23 @@ def analyze_best_strategy():
         send_alert("🟢 **Scanner Heartbeat:** Checked markets. No deals crossing the 5% margin right now.")
 
 if __name__ == "__main__":
-    send_alert("🚀 **Scanner Initialized:** Connecting to Bagel SMP database pipeline...")
-    analyze_best_strategy()
+    if "--loop" in sys.argv:
+        send_alert("🚀 **Scanner Initialized:** Endless Cloud Loop Activated. Scanning every 5 minutes...")
+        
+        start_time = time.time()
+        # Keep loop alive for ~5.5 hours (330 minutes) per worker session
+        max_duration = 330 * 60 
+        
+        while (time.time() - start_time) < max_duration:
+            try:
+                analyze_best_strategy()
+            except Exception as e:
+                print(f"Error during loop run: {e}")
+            
+            # Wait exactly 5 minutes (300 seconds)
+            time.sleep(300)
+            
+        send_alert("🔄 **Loop Cycle Complete:** Recycling server slot shortly to avoid system blockages...")
+    else:
+        send_alert("🚀 **Scanner Initialized:** Running single manual market check...")
+        analyze_best_strategy()
