@@ -4,7 +4,7 @@ import time
 import json
 import hashlib
 import statistics
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -19,9 +19,15 @@ MIN_PROFIT = float(os.getenv("MIN_PROFIT", "100"))
 MIN_ROI = float(os.getenv("MIN_ROI", "0.05"))
 AH_FEE_RATE = float(os.getenv("AH_FEE_RATE", "0.0"))
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "8"))
-BUDGET = 15000
+BUDGET = float(os.getenv("BUDGET", "15000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 HEARTBEAT = os.getenv("HEARTBEAT", "1") == "1"
+
+# A sell price is based on exactly the five cheapest active AH listings
+# for the item, measured by price per item. We then undercut that average
+# by 5% so the scanner does not assume we can sell at the market average.
+PRICE_SAMPLE_SIZE = 5
+SELL_UNDERCUT_RATE = 0.05
 
 RECIPES = {
     "diamond_sword": {"diamond": 2, "stick": 1},
@@ -40,7 +46,7 @@ session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {API_TOKEN}",
     "Accept": "application/json",
-    "User-Agent": "BagelSMP-Market-Scanner/2.0",
+    "User-Agent": "BagelSMP-Market-Scanner/3.0",
 })
 
 seen_alerts = {}
@@ -85,7 +91,6 @@ def extract_rows(data):
             value = data.get(key)
             if isinstance(value, list):
                 return value
-        # Some APIs return an item->record dictionary.
         if data and all(isinstance(v, dict) for v in data.values()):
             rows = []
             for key, value in data.items():
@@ -150,9 +155,6 @@ def normalize_auction(row):
         "unit_price", "price_per_unit", "per_unit"
     ]))
 
-    # For AH listings, the existing scanner's convention is that "price"
-    # is the total listing price. If the API supplies an explicit unit
-    # price, prefer it.
     unit = explicit_unit if explicit_unit is not None else raw_price / qty
 
     return {
@@ -179,8 +181,6 @@ def normalize_order(row):
     if not item or raw_price is None or raw_price <= 0 or qty is None or qty <= 0:
         return None
 
-    # For sell orders, "price" is treated as a per-unit price, matching
-    # the user's original scanner logic: price * quantity = total cost.
     unit = raw_price
 
     return {
@@ -218,25 +218,45 @@ def build_orders(orders):
     return result
 
 
-def conservative_exit_price(listings):
-    prices = [x["unit"] for x in listings[:7]]
-    if not prices:
+def realistic_sell_price(listings):
+    """
+    Calculate a deliberately conservative AH exit price.
+
+    The first five listings are selected by *per-item* price, so stack size
+    does not distort the comparison. The average of those five unit prices is
+    then reduced by 5% to give our target listing price.
+
+    Fewer than five listings means there is not enough market evidence, so we
+    refuse to create a deal rather than guessing from one or two listings.
+    """
+    if len(listings) < PRICE_SAMPLE_SIZE:
         return None
 
-    if len(prices) == 1:
+    sample = sorted(listings, key=lambda x: x["unit"])[:PRICE_SAMPLE_SIZE]
+    average_unit_price = statistics.mean(x["unit"] for x in sample)
+    target = average_unit_price * (1.0 - SELL_UNDERCUT_RATE)
+
+    return target
+
+
+def price_sample_details(listings):
+    if len(listings) < PRICE_SAMPLE_SIZE:
         return None
-
-    if len(prices) == 2:
-        return prices[1]
-
-    return min(prices[1], statistics.median(prices[:7]))
+    sample = sorted(listings, key=lambda x: x["unit"])[:PRICE_SAMPLE_SIZE]
+    average = statistics.mean(x["unit"] for x in sample)
+    target = average * (1.0 - SELL_UNDERCUT_RATE)
+    return {
+        "sample": sample,
+        "average": average,
+        "target": target,
+    }
 
 
 def after_fee(price):
     return price * (1.0 - AH_FEE_RATE)
 
 
-def make_opportunity(kind, item, buy_unit, qty, sell_unit, source, note):
+def make_opportunity(kind, item, buy_unit, qty, sell_unit, source, note, sell_basis=None):
     if buy_unit <= 0 or sell_unit <= 0 or qty <= 0:
         return None
 
@@ -260,6 +280,7 @@ def make_opportunity(kind, item, buy_unit, qty, sell_unit, source, note):
         "roi": roi,
         "source": source,
         "note": note,
+        "sell_basis": sell_basis or {},
     }
 
 
@@ -267,15 +288,16 @@ def scan_order_to_ah(orders, auctions):
     ideas = []
     for item, order_list in orders.items():
         ah = auctions.get(item, [])
-        if not ah:
+        basis = price_sample_details(ah)
+        if basis is None:
             continue
 
-        exit_price = conservative_exit_price(ah)
-        if exit_price is None:
-            continue
+        exit_price = basis["target"]
 
         for order in order_list[:3]:
-            qty = min(order["qty"], ah[0]["qty"])
+            # An order's available quantity is treated as the quantity that
+            # can be purchased. We do not invent extra stock.
+            qty = order["qty"]
             idea = make_opportunity(
                 "ORDER -> AH",
                 item,
@@ -283,7 +305,8 @@ def scan_order_to_ah(orders, auctions):
                 qty,
                 exit_price,
                 order["seller"],
-                f"buy order stock from {order['seller']}",
+                f"buy up to {int(qty)} available item(s) from {order['seller']}",
+                sell_basis=basis,
             )
             if idea:
                 ideas.append(idea)
@@ -293,15 +316,22 @@ def scan_order_to_ah(orders, auctions):
 def scan_ah_flip(auctions):
     ideas = []
     for item, listings in auctions.items():
-        if len(listings) < 3:
+        if len(listings) < PRICE_SAMPLE_SIZE:
             continue
 
+        listings = sorted(listings, key=lambda x: x["unit"])
         cheapest = listings[0]
-        exit_price = conservative_exit_price(listings)
-
-        if exit_price is None or exit_price <= cheapest["unit"]:
+        basis = price_sample_details(listings)
+        if basis is None:
             continue
 
+        exit_price = basis["target"]
+
+        if exit_price <= cheapest["unit"]:
+            continue
+
+        # A listing is a real stack/lot. We therefore keep its actual
+        # quantity instead of pretending we can buy only part of it.
         idea = make_opportunity(
             "AH -> AH",
             item,
@@ -309,7 +339,8 @@ def scan_ah_flip(auctions):
             cheapest["qty"],
             exit_price,
             cheapest["seller"],
-            "buy the cheapest listing and relist near the conservative market price",
+            "buy the cheapest full listing and relist its actual quantity",
+            sell_basis=basis,
         )
         if idea:
             ideas.append(idea)
@@ -337,7 +368,11 @@ def scan_crafting(orders, auctions, prices):
     ideas = []
 
     for product, recipe in RECIPES.items():
-        if product not in auctions or len(auctions[product]) < 2:
+        if product not in auctions:
+            continue
+
+        basis = price_sample_details(auctions[product])
+        if basis is None:
             continue
 
         cost = 0
@@ -353,10 +388,7 @@ def scan_crafting(orders, auctions, prices):
         if not possible:
             continue
 
-        sell = conservative_exit_price(auctions[product])
-        if sell is None:
-            continue
-
+        sell = basis["target"]
         idea = make_opportunity(
             "CRAFT",
             product,
@@ -365,6 +397,7 @@ def scan_crafting(orders, auctions, prices):
             sell,
             "market materials",
             "buy the cheapest materials, craft one item, then relist",
+            sell_basis=basis,
         )
 
         if idea:
@@ -380,16 +413,12 @@ def scan_budget(ideas):
     result = []
 
     for idea in ideas:
-        affordable = int(BUDGET // idea["buy_total"])
-        if affordable <= 0:
+        # Do not reduce the quantity of an AH listing to fit the budget.
+        # That would create an impossible recommendation if the listing is
+        # sold only as a complete stack/lot. Instead, reject the opportunity
+        # unless the complete purchase fits the budget.
+        if idea["buy_total"] > BUDGET:
             continue
-
-        idea = dict(idea)
-        idea["qty"] = min(idea["qty"], affordable)
-        idea["buy_total"] = idea["buy_unit"] * idea["qty"]
-        idea["revenue"] = after_fee(idea["sell_unit"]) * idea["qty"]
-        idea["profit"] = idea["revenue"] - idea["buy_total"]
-        idea["roi"] = idea["profit"] / idea["buy_total"]
 
         result.append(idea)
 
@@ -405,6 +434,7 @@ def dedupe_and_rank(ideas):
             idea["item"],
             round(idea["buy_unit"], 4),
             round(idea["sell_unit"], 4),
+            idea["qty"],
         )
 
         old = unique.get(key)
@@ -413,11 +443,7 @@ def dedupe_and_rank(ideas):
             unique[key] = idea
 
     ideas = list(unique.values())
-    ideas.sort(
-        key=lambda x: (x["profit"], x["roi"]),
-        reverse=True
-    )
-
+    ideas.sort(key=lambda x: (x["profit"], x["roi"]), reverse=True)
     return ideas[:MAX_ALERTS]
 
 
@@ -432,10 +458,15 @@ def format_alert(ideas):
         "BAGEL SMP 鈥� DEAL FOUND",
         "",
         f"Your budget: {money(BUDGET) if BUDGET > 0 else 'No limit'} coins",
+        "Sell prices use the 5 cheapest active listings by price per item, averaged and reduced by 5%.",
         "",
     ]
 
     for i, x in enumerate(ideas, 1):
+        basis = x.get("sell_basis", {})
+        sample = basis.get("sample", [])
+        average = basis.get("average")
+
         lines.extend([
             f"DEAL {i}: {x['item'].upper()}",
             f"METHOD: {x['kind']}",
@@ -449,11 +480,26 @@ def format_alert(ideas):
             "",
             f"ESTIMATED PROFIT: {money(x['profit'])} coins.",
             f"RETURN ON MONEY SPENT: {x['roi'] * 100:.1f}%.",
+        ])
+
+        if sample and average is not None:
+            sample_text = ", ".join(
+                f"{int(round(s['qty']))} for {money(s['total'])} ({money(s['unit'])}/each)"
+                for s in sample
+            )
+            lines.extend([
+                "",
+                f"PRICE CHECK: The 5 cheapest listings were: {sample_text}.",
+                f"AVERAGE OF THOSE 5: {money(average)} coins each.",
+                "YOUR SELL PRICE: 5% below that average.",
+            ])
+
+        lines.extend([
             "",
             f"WHAT TO DO: {x['note'].capitalize()}.",
             "",
-            "IMPORTANT: The sell price is an estimate based on current market listings.",
-            "Check the live market before buying because another player can change the price.",
+            "IMPORTANT: This is a market-based estimate, not a guaranteed sale.",
+            "Check the live market before buying because another player can change listings.",
             "",
             "------------------------------",
             "",
@@ -467,7 +513,6 @@ def send_discord(message):
         print("Discord webhook not configured.")
         return
 
-    # Discord message limit is 2000 characters.
     chunks = [message[i:i + 1900] for i in range(0, len(message), 1900)]
 
     for chunk in chunks:
@@ -533,7 +578,7 @@ def run_once():
     elif HEARTBEAT:
         send_discord(
             "BAGEL SMP 鈥� NO DEAL FOUND\n"
-            f"I checked the market successfully. There is currently no deal "
+            "I checked the market successfully. There is currently no deal "
             f"that meets both requirements: at least {MIN_ROI * 100:.1f}% "
             f"return and at least {money(MIN_PROFIT)} coins profit.\n\n"
             f"Your budget: {money(BUDGET) if BUDGET > 0 else 'No limit'} coins.\n"
@@ -552,6 +597,7 @@ def main():
     print(f"Minimum ROI: {MIN_ROI * 100:.1f}%")
     print(f"Minimum profit: {MIN_PROFIT}")
     print(f"AH fee rate: {AH_FEE_RATE * 100:.2f}%")
+    print(f"Sell-price sample: {PRICE_SAMPLE_SIZE} cheapest listings, then 5% under average")
     budget_text = money(BUDGET) if BUDGET > 0 else "No limit"
     print(f"Budget: {budget_text} coins")
 
