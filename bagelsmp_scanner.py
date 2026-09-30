@@ -24,7 +24,7 @@ MAX_ALERTS = int(os.getenv("MAX_ALERTS", "8"))
 # CHANGE ONLY THIS NUMBER to your available Bagel SMP budget.
 # Example: 100000 = 100,000 coins.
 # Set to 0 if you do not want a budget limit.
-MY_BUDGET = 100000
+MY_BUDGET = 15000
 # =========================================================
 
 BUDGET = float(MY_BUDGET)
