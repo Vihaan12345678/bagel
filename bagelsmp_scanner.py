@@ -20,14 +20,7 @@ MIN_PROFIT = float(os.getenv("MIN_PROFIT", "100"))
 MIN_ROI = float(os.getenv("MIN_ROI", "0.05"))
 AH_FEE_RATE = float(os.getenv("AH_FEE_RATE", "0.0"))
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "8"))
-# ===================== EASY SETTINGS =====================
-# CHANGE ONLY THIS NUMBER to your available Bagel SMP budget.
-# Example: 100000 = 100,000 coins.
-# Set to 0 if you do not want a budget limit.
-MY_BUDGET = 15000
-# =========================================================
-
-BUDGET = float(MY_BUDGET)
+BUDGET = float(os.getenv("BUDGET", "0"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 HEARTBEAT = os.getenv("HEARTBEAT", "1") == "1"
 
@@ -437,21 +430,33 @@ def money(value):
 
 def format_alert(ideas):
     lines = [
-        "**BAGEL SMP ACTIONABLE MARKET ALERTS**",
-        f"Threshold: {MIN_ROI * 100:.1f}% ROI / {money(MIN_PROFIT)} profit",
+        "BAGEL SMP 鈥� DEAL FOUND",
+        "",
+        f"Your budget: {money(BUDGET) if BUDGET > 0 else 'No limit'} coins",
         "",
     ]
 
     for i, x in enumerate(ideas, 1):
         lines.extend([
-            f"**#{i} {x['kind']} 鈥� {x['item'].upper()}**",
-            f"BUY: {x['qty']} x {money(x['buy_unit'])} = **{money(x['buy_total'])}**",
-            f"SELL TARGET: {money(x['sell_unit'])} each",
-            f"EST. REVENUE AFTER FEES: {money(x['revenue'])}",
-            f"EST. PROFIT: **+{money(x['profit'])}**",
-            f"ROI: **{x['roi'] * 100:.1f}%**",
-            f"SOURCE: {x['source']}",
-            f"ACTION: {x['note']}.",
+            f"DEAL {i}: {x['item'].upper()}",
+            f"METHOD: {x['kind']}",
+            "",
+            f"STEP 1 鈥� BUY: {x['qty']} item(s) at {money(x['buy_unit'])} coins each.",
+            f"TOTAL TO SPEND: {money(x['buy_total'])} coins.",
+            f"BUY FROM: {x['source']}.",
+            "",
+            f"STEP 2 鈥� SELL: List them for about {money(x['sell_unit'])} coins each.",
+            f"ESTIMATED SALES REVENUE: {money(x['revenue'])} coins.",
+            "",
+            f"ESTIMATED PROFIT: {money(x['profit'])} coins.",
+            f"RETURN ON MONEY SPENT: {x['roi'] * 100:.1f}%.",
+            "",
+            f"WHAT TO DO: {x['note'].capitalize()}.",
+            "",
+            "IMPORTANT: The sell price is an estimate based on current market listings.",
+            "Check the live market before buying because another player can change the price.",
+            "",
+            "------------------------------",
             "",
         ])
 
@@ -493,8 +498,9 @@ def run_once():
 
     if prices_raw is None or orders_raw is None or auctions_raw is None:
         send_discord(
-            "**Bagel SMP scanner error**\n"
-            "One or more market endpoints failed. "
+            "BAGEL SMP 鈥� SCANNER ERROR\n"
+            "The market could not be checked completely this time. "
+            "No buying decision should be made from this scan. "
             "Check the GitHub Actions log for the HTTP status."
         )
         return
@@ -527,9 +533,12 @@ def run_once():
 
     elif HEARTBEAT:
         send_discord(
-            "**Bagel SMP scanner heartbeat**\n"
-            "Market checked successfully. No opportunity currently "
-            f"meets {MIN_ROI * 100:.1f}% ROI and {money(MIN_PROFIT)} profit."
+            "BAGEL SMP 鈥� NO DEAL FOUND\n"
+            f"I checked the market successfully. There is currently no deal "
+            f"that meets both requirements: at least {MIN_ROI * 100:.1f}% "
+            f"return and at least {money(MIN_PROFIT)} coins profit.\n\n"
+            f"Your budget: {money(BUDGET) if BUDGET > 0 else 'No limit'} coins.\n"
+            "I will check again on the next scan."
         )
 
 
@@ -544,6 +553,7 @@ def main():
     print(f"Minimum ROI: {MIN_ROI * 100:.1f}%")
     print(f"Minimum profit: {MIN_PROFIT}")
     print(f"AH fee rate: {AH_FEE_RATE * 100:.2f}%")
+    print(f"Budget: {money(BUDGET) if BUDGET > 0 else "No limit"} coins")
 
     if "--loop" not in sys.argv:
         run_once()
@@ -559,8 +569,9 @@ def main():
         except Exception as exc:
             print(f"Unexpected scan error: {exc}")
             send_discord(
-                "**Bagel SMP scanner error**\n"
-                f"Unexpected error: `{type(exc).__name__}`"
+                "BAGEL SMP 鈥� SCANNER ERROR\n"
+                f"The scanner hit an unexpected error: {type(exc).__name__}. "
+                "It will try again on the next scan."
             )
 
         elapsed = time.time() - cycle_started
