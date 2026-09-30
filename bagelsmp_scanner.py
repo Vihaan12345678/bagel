@@ -19,7 +19,7 @@ MIN_PROFIT = float(os.getenv("MIN_PROFIT", "100"))
 MIN_ROI = float(os.getenv("MIN_ROI", "0.05"))
 AH_FEE_RATE = float(os.getenv("AH_FEE_RATE", "0.0"))
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "8"))
-BUDGET = float(os.getenv("BUDGET", "0"))
+BUDGET = 15000
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 HEARTBEAT = os.getenv("HEARTBEAT", "1") == "1"
 
