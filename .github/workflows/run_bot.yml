@@ -22,14 +22,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install requests
 
-      - name: Verify Python File
+      - name: Verify Scanner
         run: |
           python --version
           python -m py_compile bagelsmp_scanner.py
