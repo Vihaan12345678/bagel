@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -553,7 +552,8 @@ def main():
     print(f"Minimum ROI: {MIN_ROI * 100:.1f}%")
     print(f"Minimum profit: {MIN_PROFIT}")
     print(f"AH fee rate: {AH_FEE_RATE * 100:.2f}%")
-    print(f"Budget: {money(BUDGET) if BUDGET > 0 else "No limit"} coins")
+    budget_text = money(BUDGET) if BUDGET > 0 else "No limit"
+    print(f"Budget: {budget_text} coins")
 
     if "--loop" not in sys.argv:
         run_once()
