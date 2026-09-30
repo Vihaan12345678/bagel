@@ -1,26 +1,48 @@
 name: Bagel SMP Market Scanner
 
 on:
-workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: bagel-smp-market-scanner
+  cancel-in-progress: false
 
 jobs:
-scan:
-runs-on: ubuntu-latest
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
 
-steps:
-  - name: Checkout Repository Code
-    uses: actions/checkout@v4
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
 
-  - name: Set up Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: "3.10"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
 
-  - name: Install Requests
-    run: python -m pip install requests
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
 
-  - name: Run Bagel SMP Scanner
-    env:
-      BAGEL_API_TOKEN: ${{ secrets.BAGEL_API_TOKEN }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-    run: python bagelsmp_scanner.py
+      - name: Verify Python File
+        run: |
+          python --version
+          python -m py_compile bagelsmp_scanner.py
+
+      - name: Run Bagel SMP Scanner
+        env:
+          BAGEL_API_TOKEN: ${{ secrets.BAGEL_API_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SCAN_SECONDS: '300'
+          MAX_DURATION_SECONDS: '19800'
+          MIN_PROFIT: '100'
+          MIN_ROI: '0.05'
+          AH_FEE_RATE: '0.00'
+          MAX_ALERTS: '8'
+          HEARTBEAT: '1'
+        run: python bagelsmp_scanner.py --loop
