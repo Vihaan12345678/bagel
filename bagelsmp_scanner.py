@@ -4,7 +4,7 @@ import time
 import json
 import hashlib
 import statistics
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -20,6 +20,7 @@ MIN_ROI = float(os.getenv("MIN_ROI", "0.05"))
 AH_FEE_RATE = float(os.getenv("AH_FEE_RATE", "0.0"))
 MAX_ALERTS = int(os.getenv("MAX_ALERTS", "8"))
 BUDGET = float(os.getenv("BUDGET", "100000"))
+MIN_DURABILITY_PERCENT = float(os.getenv("MIN_DURABILITY_PERCENT", "70"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 HEARTBEAT = os.getenv("HEARTBEAT", "1") == "1"
 
@@ -28,6 +29,52 @@ HEARTBEAT = os.getenv("HEARTBEAT", "1") == "1"
 # by 5% so the scanner does not assume we can sell at the market average.
 PRICE_SAMPLE_SIZE = 5
 SELL_UNDERCUT_RATE = 0.05
+
+# Enchantment demand is used as a marketability signal, NOT as a fake price
+# multiplier. These are item-specific usefulness priorities based on Minecraft
+# enchantment effects. Live Bagel market data still decides the actual price.
+ENCHANTMENT_DEMAND = {
+    "tools": {
+        "efficiency": 1.00, "fortune": 1.00, "mending": 0.95,
+        "unbreaking": 0.90, "silk_touch": 0.85,
+    },
+    "weapons": {
+        "sharpness": 1.00, "looting": 0.95, "mending": 0.95,
+        "unbreaking": 0.90, "fire_aspect": 0.70, "knockback": 0.45,
+        "smite": 0.45, "bane_of_arthropods": 0.25,
+    },
+    "armor": {
+        "protection": 1.00, "mending": 1.00, "unbreaking": 0.95,
+        "feather_falling": 0.95, "respiration": 0.80,
+        "aqua_affinity": 0.70, "depth_strider": 0.85,
+        "fire_protection": 0.55, "blast_protection": 0.45,
+        "projectile_protection": 0.45, "thorns": 0.30,
+        "frost_walker": 0.30,
+    },
+    "bow": {
+        "power": 1.00, "infinity": 0.95, "mending": 0.95,
+        "unbreaking": 0.90, "flame": 0.75, "punch": 0.55,
+    },
+    "crossbow": {
+        "quick_charge": 1.00, "piercing": 0.85,
+        "multishot": 0.75, "unbreaking": 0.90, "mending": 0.95,
+    },
+    "trident": {
+        "loyalty": 1.00, "impaling": 0.80, "channeling": 0.75,
+        "riptide": 0.65, "mending": 0.95, "unbreaking": 0.90,
+    },
+    "fishing_rod": {
+        "luck_of_the_sea": 1.00, "lure": 0.85,
+        "mending": 0.95, "unbreaking": 0.90,
+    },
+    "mace": {
+        "density": 1.00, "breach": 0.90, "wind_burst": 0.90,
+        "mending": 0.95, "unbreaking": 0.90,
+    },
+}
+
+NEGATIVE_ENCHANTMENTS = {"curse_of_binding", "curse_of_vanishing", "binding", "vanishing"}
+
 
 RECIPES = {
     "diamond_sword": {"diamond": 2, "stick": 1},
@@ -136,6 +183,217 @@ def normalize_name(row):
     return text(value).lower().replace("minecraft:", "").strip()
 
 
+def canonical_enchant_name(value):
+    value = text(value).lower().replace("minecraft:", "")
+    value = value.replace(" ", "_").replace("-", "_")
+    aliases = {
+        "sharpness": "sharpness", "unbreaking": "unbreaking",
+        "mending": "mending", "efficiency": "efficiency",
+        "fortune": "fortune", "silk_touch": "silk_touch",
+        "protection": "protection", "feather_falling": "feather_falling",
+        "depth_strider": "depth_strider", "aqua_affinity": "aqua_affinity",
+        "fire_protection": "fire_protection", "blast_protection": "blast_protection",
+        "projectile_protection": "projectile_protection", "respiration": "respiration",
+        "looting": "looting", "fire_aspect": "fire_aspect", "knockback": "knockback",
+        "smite": "smite", "bane_of_arthropods": "bane_of_arthropods",
+        "power": "power", "punch": "punch", "flame": "flame", "infinity": "infinity",
+        "quick_charge": "quick_charge", "piercing": "piercing", "multishot": "multishot",
+        "loyalty": "loyalty", "riptide": "riptide", "channeling": "channeling",
+        "impaling": "impaling", "luck_of_the_sea": "luck_of_the_sea", "lure": "lure",
+        "thorns": "thorns", "frost_walker": "frost_walker", "soul_speed": "soul_speed",
+        "swift_sneak": "swift_sneak", "wind_burst": "wind_burst", "density": "density",
+        "breach": "breach", "curse_of_binding": "curse_of_binding",
+        "curse_of_vanishing": "curse_of_vanishing", "binding": "curse_of_binding",
+        "vanishing": "curse_of_vanishing",
+    }
+    return aliases.get(value, value)
+
+
+def extract_enchantments(row):
+    """Extract enchantments from common API/NBT/metadata shapes.
+
+    Returns a canonical tuple like (("efficiency", 5), ("mending", 1)).
+    Unknown enchantment names are preserved rather than discarded.
+    """
+    found = {}
+
+    def add(name, level=1):
+        name = canonical_enchant_name(name)
+        if not name:
+            return
+        lvl = num(level, 1) or 1
+        found[name] = max(found.get(name, 0), int(lvl))
+
+    def parse(obj, depth=0, allow_name=False):
+        if depth > 5 or obj is None:
+            return
+        if isinstance(obj, list):
+            for x in obj:
+                parse(x, depth + 1, allow_name=True)
+            return
+        if isinstance(obj, str):
+            for part in obj.replace(";", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                bits = part.rsplit(" ", 1)
+                if len(bits) == 2 and bits[1].isdigit():
+                    add(bits[0], int(bits[1]))
+                else:
+                    add(part, 1)
+            return
+        if not isinstance(obj, dict):
+            return
+
+        # Only treat name/id as an enchantment when we are inside an
+        # enchantment object. Never interpret the item's own name as an enchant.
+        if allow_name:
+            name = first_value(obj, ["enchantment", "ench", "name", "id", "key", "type"])
+            level = first_value(obj, ["level", "lvl", "amplifier", "value"])
+            if name is not None and not isinstance(name, (dict, list)):
+                add(name, level if level is not None else 1)
+        else:
+            name = first_value(obj, ["enchantment", "ench"])
+            level = first_value(obj, ["level", "lvl", "amplifier", "value"])
+            if name is not None and not isinstance(name, (dict, list)):
+                add(name, level if level is not None else 1)
+
+        for key in ("enchantments", "enchants", "enchantment_data", "enchantment_data_list", "stored_enchantments", "storedEnchants", "effects"):
+            value = first_value(obj, [key])
+            if value is not None:
+                if isinstance(value, dict):
+                    # Common compact form: {"efficiency": 5, "fortune": 3}.
+                    for k, v in value.items():
+                        if isinstance(v, (int, float, str)) and not isinstance(v, bool):
+                            add(k, v)
+                        else:
+                            parse(v, depth + 1, allow_name=True)
+                else:
+                    parse(value, depth + 1, allow_name=True)
+
+        for key in ("metadata", "meta", "item_meta", "nbt", "tag", "item", "data"):
+            value = first_value(obj, [key])
+            if isinstance(value, (dict, list)):
+                parse(value, depth + 1, allow_name=False)
+
+    parse(row)
+    return tuple(sorted(found.items()))
+
+def item_category(item):
+    name = item.lower()
+    if any(x in name for x in ("helmet", "chestplate", "leggings", "boots", "armor")):
+        return "armor"
+    if "bow" in name and "crossbow" not in name:
+        return "bow"
+    if "crossbow" in name:
+        return "crossbow"
+    if "trident" in name:
+        return "trident"
+    if "fishing_rod" in name or "fishing rod" in name:
+        return "fishing_rod"
+    if "mace" in name:
+        return "mace"
+    if any(x in name for x in ("sword", "axe")):
+        return "weapons"
+    if any(x in name for x in ("pickaxe", "shovel", "hoe")):
+        return "tools"
+    return "tools"
+
+
+def enchantment_demand_score(item, enchantments):
+    if not enchantments:
+        return 0.0
+    profile = ENCHANTMENT_DEMAND.get(item_category(item), {})
+    positive = 0.0
+    negative = 0.0
+    for name, level in enchantments:
+        weight = profile.get(name, 0.35)
+        if name in NEGATIVE_ENCHANTMENTS:
+            negative += 1.0
+        else:
+            # Higher levels are generally more desirable, but cap their effect
+            # so a single level cannot dominate the whole score.
+            positive += weight * min(level, 5) / 5.0
+    return max(0.0, positive - negative)
+
+
+def enchantment_text(enchantments):
+    if not enchantments:
+        return "None"
+    def roman(n):
+        vals = [(10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+        out = ""
+        for value, symbol in vals:
+            while n >= value:
+                out += symbol
+                n -= value
+        return out
+    return ", ".join(f"{name.replace('_', ' ').title()} {roman(level)}" for name, level in enchantments)
+
+
+def comparable_key(row):
+    # Enchanted equipment is compared only with the same enchantment set.
+    # Non-equipment items simply compare by item name.
+    enchants = row.get("enchantments", ())
+    return (row["item"], enchants)
+
+
+def extract_durability(row):
+    """Return durability percent when the API exposes enough information.
+
+    Supports common Minecraft/API representations: durability/max_durability,
+    current/max durability, or damage/max_damage. If the API does not expose
+    durability, return None rather than guessing.
+    """
+    if not isinstance(row, dict):
+        return None
+
+    def walk(obj, depth=0):
+        if depth > 3 or not isinstance(obj, dict):
+            return None
+
+        # Direct percentage fields.
+        for key in ("durability_percent", "durability_percentage", "durability_pct"):
+            v = num(first_value(obj, [key]))
+            if v is not None:
+                return max(0.0, min(100.0, v if v <= 100 else v / 100.0))
+
+        current = num(first_value(obj, [
+            "durability", "current_durability", "remaining_durability",
+            "durability_remaining", "current"
+        ]))
+        maximum = num(first_value(obj, [
+            "max_durability", "maximum_durability", "durability_max",
+            "max_damage", "maximum_damage"
+        ]))
+        if current is not None and maximum is not None and maximum > 0:
+            # If the API gives damage rather than remaining durability, use
+            # damage/max_damage below. Otherwise current/max is the natural form.
+            if first_value(obj, ["damage", "current_damage", "item_damage"]) is not None:
+                return max(0.0, min(100.0, 100.0 * (1.0 - current / maximum)))
+            return max(0.0, min(100.0, 100.0 * current / maximum))
+
+        damage = num(first_value(obj, ["damage", "current_damage", "item_damage"]))
+        max_damage = num(first_value(obj, ["max_damage", "maximum_damage", "durability_max"]))
+        if damage is not None and max_damage is not None and max_damage > 0:
+            return max(0.0, min(100.0, 100.0 * (1.0 - damage / max_damage)))
+
+        for value in obj.values():
+            if isinstance(value, dict):
+                found = walk(value, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(row)
+
+
+def durability_ok(row):
+    """Reject known-low-durability equipment; keep items with no durability data."""
+    durability = row.get("durability_percent")
+    return durability is None or durability >= MIN_DURABILITY_PERCENT
+
+
 def normalize_auction(row):
     item = normalize_name(row)
     raw_price = num(first_value(row, [
@@ -147,6 +405,8 @@ def normalize_auction(row):
     seller = text(first_value(row, [
         "seller", "username", "owner", "player", "seller_name"
     ]), "Unknown")
+    durability_percent = extract_durability(row)
+    enchantments = extract_enchantments(row)
 
     if not item or raw_price is None or raw_price <= 0 or qty is None or qty <= 0:
         return None
@@ -163,6 +423,9 @@ def normalize_auction(row):
         "qty": qty,
         "unit": unit,
         "seller": seller,
+        "durability_percent": durability_percent,
+        "enchantments": enchantments,
+        "demand_score": enchantment_demand_score(item, enchantments),
     }
 
 
@@ -177,6 +440,7 @@ def normalize_order(row):
     seller = text(first_value(row, [
         "seller", "username", "owner", "player", "seller_name"
     ]), "Unknown")
+    enchantments = extract_enchantments(row)
 
     if not item or raw_price is None or raw_price <= 0 or qty is None or qty <= 0:
         return None
@@ -189,6 +453,8 @@ def normalize_order(row):
         "qty": qty,
         "unit": unit,
         "seller": seller,
+        "enchantments": enchantments,
+        "demand_score": enchantment_demand_score(item, enchantments),
     }
 
 
@@ -196,7 +462,7 @@ def build_auction_book(auctions):
     book = {}
     for raw in extract_rows(auctions):
         row = normalize_auction(raw)
-        if row:
+        if row and durability_ok(row):
             book.setdefault(row["item"], []).append(row)
 
     for item in book:
@@ -219,38 +485,39 @@ def build_orders(orders):
 
 
 def realistic_sell_price(listings):
-    """
-    Calculate a deliberately conservative AH exit price.
+    details = price_sample_details(listings)
+    return details["target"] if details else None
 
-    The first five listings are selected by *per-item* price, so stack size
-    does not distort the comparison. The average of those five unit prices is
-    then reduced by 5% to give our target listing price.
 
-    Fewer than five listings means there is not enough market evidence, so we
-    refuse to create a deal rather than guessing from one or two listings.
+def price_sample_details(listings, target_listing=None):
+    """Return a conservative sell price from comparable listings.
+
+    For enchanted gear, only listings with the same enchantment set are
+    comparable. Known-low durability listings have already been removed.
+    Exactly five listings are required. Prices are normalized per item.
     """
-    if len(listings) < PRICE_SAMPLE_SIZE:
+    if target_listing is not None:
+        key = comparable_key(target_listing)
+        comparable = [x for x in listings if comparable_key(x) == key]
+    else:
+        comparable = listings
+
+    if len(comparable) < PRICE_SAMPLE_SIZE:
         return None
 
-    sample = sorted(listings, key=lambda x: x["unit"])[:PRICE_SAMPLE_SIZE]
+    sample = sorted(comparable, key=lambda x: x["unit"])[:PRICE_SAMPLE_SIZE]
     average_unit_price = statistics.mean(x["unit"] for x in sample)
     target = average_unit_price * (1.0 - SELL_UNDERCUT_RATE)
-
-    return target
-
-
-def price_sample_details(listings):
-    if len(listings) < PRICE_SAMPLE_SIZE:
-        return None
-    sample = sorted(listings, key=lambda x: x["unit"])[:PRICE_SAMPLE_SIZE]
-    average = statistics.mean(x["unit"] for x in sample)
-    target = average * (1.0 - SELL_UNDERCUT_RATE)
     return {
         "sample": sample,
-        "average": average,
+        "average": average_unit_price,
         "target": target,
+        "comparable_count": len(comparable),
     }
 
+
+def best_comparable_basis(listings, target_listing):
+    return price_sample_details(listings, target_listing=target_listing)
 
 def after_fee(price):
     return price * (1.0 - AH_FEE_RATE)
@@ -281,6 +548,8 @@ def make_opportunity(kind, item, buy_unit, qty, sell_unit, source, note, sell_ba
         "source": source,
         "note": note,
         "sell_basis": sell_basis or {},
+        "enchantments": (),
+        "demand_score": 0.0,
     }
 
 
@@ -288,15 +557,20 @@ def scan_order_to_ah(orders, auctions):
     ideas = []
     for item, order_list in orders.items():
         ah = auctions.get(item, [])
-        basis = price_sample_details(ah)
-        if basis is None:
-            continue
-
-        exit_price = basis["target"]
-
         for order in order_list[:3]:
-            # An order's available quantity is treated as the quantity that
-            # can be purchased. We do not invent extra stock.
+            # Match an order to the same enchantment set when possible.
+            basis = price_sample_details(ah, target_listing=order)
+            if basis is None:
+                # For orders without enchantment metadata, fall back to the
+                # base item market only. This avoids pretending enchanted and
+                # unenchanted gear are equivalent.
+                if order.get("enchantments"):
+                    continue
+                basis = price_sample_details(ah)
+            if basis is None:
+                continue
+
+            exit_price = basis["target"]
             qty = order["qty"]
             idea = make_opportunity(
                 "ORDER -> AH",
@@ -309,9 +583,10 @@ def scan_order_to_ah(orders, auctions):
                 sell_basis=basis,
             )
             if idea:
+                idea["enchantments"] = order.get("enchantments", ())
+                idea["demand_score"] = enchantment_demand_score(item, idea["enchantments"])
                 ideas.append(idea)
     return ideas
-
 
 def scan_ah_flip(auctions):
     ideas = []
@@ -321,17 +596,14 @@ def scan_ah_flip(auctions):
 
         listings = sorted(listings, key=lambda x: x["unit"])
         cheapest = listings[0]
-        basis = price_sample_details(listings)
+        basis = best_comparable_basis(listings, cheapest)
         if basis is None:
             continue
 
         exit_price = basis["target"]
-
         if exit_price <= cheapest["unit"]:
             continue
 
-        # A listing is a real stack/lot. We therefore keep its actual
-        # quantity instead of pretending we can buy only part of it.
         idea = make_opportunity(
             "AH -> AH",
             item,
@@ -339,13 +611,17 @@ def scan_ah_flip(auctions):
             cheapest["qty"],
             exit_price,
             cheapest["seller"],
-            "buy the cheapest full listing and relist its actual quantity",
+            "buy the cheapest full listing and relist its actual quantity" + (
+                f"; durability {cheapest['durability_percent']:.0f}%"
+                if cheapest.get("durability_percent") is not None else ""
+            ),
             sell_basis=basis,
         )
         if idea:
+            idea["enchantments"] = cheapest.get("enchantments", ())
+            idea["demand_score"] = cheapest.get("demand_score", 0.0)
             ideas.append(idea)
     return ideas
-
 
 def scan_crafting(orders, auctions, prices):
     material_prices = {}
@@ -443,7 +719,9 @@ def dedupe_and_rank(ideas):
             unique[key] = idea
 
     ideas = list(unique.values())
-    ideas.sort(key=lambda x: (x["profit"], x["roi"]), reverse=True)
+    # Profit remains the primary ranking. Demand is only a tie-breaker so
+    # desirable enchantments can surface before equally-profitable weak ones.
+    ideas.sort(key=lambda x: (x["profit"], x["roi"], x.get("demand_score", 0.0)), reverse=True)
     return ideas[:MAX_ALERTS]
 
 
@@ -467,9 +745,17 @@ def format_alert(ideas):
         sample = basis.get("sample", [])
         average = basis.get("average")
 
+        enchantments = x.get("enchantments", ())
         lines.extend([
             f"DEAL {i}: {x['item'].upper()}",
             f"METHOD: {x['kind']}",
+        ])
+        if enchantments:
+            lines.extend([
+                f"ENCHANTMENTS: {enchantment_text(enchantments)}",
+                f"ENCHANTMENT DEMAND SCORE: {x.get('demand_score', 0.0):.2f} (higher means the enchantments are generally more useful)",
+            ])
+        lines.extend([
             "",
             f"STEP 1 鈥� BUY: {x['qty']} item(s) at {money(x['buy_unit'])} coins each.",
             f"TOTAL TO SPEND: {money(x['buy_total'])} coins.",
@@ -491,6 +777,7 @@ def format_alert(ideas):
                 "",
                 f"PRICE CHECK: The 5 cheapest listings were: {sample_text}.",
                 f"AVERAGE OF THOSE 5: {money(average)} coins each.",
+                f"COMPARABLE LISTINGS FOUND: {basis.get('comparable_count', len(sample))}.",
                 "YOUR SELL PRICE: 5% below that average.",
             ])
 
