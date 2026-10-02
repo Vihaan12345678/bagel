@@ -30,6 +30,9 @@ SELL_MULTIPLIER = float(os.getenv("SELL_MULTIPLIER", "1.0"))
 # by 5% so the scanner does not assume we can sell at the market average.
 PRICE_SAMPLE_SIZE = 5
 SELL_UNDERCUT_RATE = 0.05
+# Never treat a wildly higher AH asking price as a realistic exit when active
+# player orders are dramatically lower. This is a sanity check, not a price source.
+MAX_AH_TO_ORDER_PRICE_RATIO = float(os.getenv("MAX_AH_TO_ORDER_PRICE_RATIO", "1.50"))
 
 # Enchantment demand is used as a marketability signal, NOT as a fake price
 # multiplier. These are item-specific usefulness priorities based on Minecraft
@@ -475,45 +478,45 @@ def normalize_auction(row):
 
 
 def normalize_order(row):
-    """Normalize an order to a per-item price.
+    """Normalize an active player order.
 
-    IMPORTANT: a field named `price` is treated as the total price for the
-    requested quantity when no explicit unit-price field is supplied.
-    Therefore 1,200 for 16 items becomes 75 coins each, not 1,200 each.
-    Explicit unit-price fields always win.
+    IMPORTANT: Bagel orders are quoted PER ITEM. If an order wants 16 items
+    at 1,200 coins each, the order value is 19,200 coins. Do NOT divide the
+    order price by quantity. This is different from an AH listing, where the
+    listing price is a total and must be divided by quantity.
     """
     item = normalize_name(row)
     qty = num(first_value(row, [
-        "quantity", "qty", "amount_available", "stock", "count", "amount"
+        "remaining_quantity", "remaining_qty", "remaining",
+        "amount_remaining", "available_quantity", "available_qty",
+        "quantity_available", "quantity", "qty", "amount", "count", "stock"
     ]), 1)
     if not item or qty is None or qty <= 0:
         return None
 
     explicit_unit = num(first_value(row, [
-        "unit_price", "price_per_unit", "per_unit", "unitPrice"
+        "unit_price", "price_per_unit", "per_unit", "unitPrice", "price_each", "priceEach"
     ]))
-    total_price = num(first_value(row, [
-        "total_price", "totalPrice", "order_total", "total"
-    ]))
-    generic_price = num(first_value(row, ["price"]))
+    # On the Bagel order board, price is the amount paid for EACH item.
+    generic_price = num(first_value(row, ["price", "price_each", "priceEach", "offer_price", "bid_price"]))
 
     if explicit_unit is not None and explicit_unit > 0:
         unit = explicit_unit
-    elif total_price is not None and total_price > 0:
-        unit = total_price / qty
     elif generic_price is not None and generic_price > 0:
-        # Bagel order data can expose a single `price` for the whole order.
-        # Normalize it by quantity so stack/lot prices are never mistaken for
-        # per-item prices.
-        unit = generic_price / qty if qty > 1 else generic_price
+        unit = generic_price
     else:
-        return None
+        # Some APIs expose an order total instead of price_each. Only use an
+        # explicitly named total here; never guess that a generic price is a total.
+        total_price = num(first_value(row, ["total_price", "totalPrice", "order_total", "total_value"]))
+        if total_price is None or total_price <= 0:
+            return None
+        unit = total_price / qty
 
     if unit <= 0:
         return None
 
-    seller = text(first_value(row, [
-        "buyer", "username", "owner", "player", "buyer_name", "seller", "seller_name"
+    buyer = text(first_value(row, [
+        "buyer", "buyer_name", "username", "owner", "player", "player_name", "seller", "seller_name"
     ]), "Unknown")
     enchantments = extract_enchantments(row)
 
@@ -522,7 +525,7 @@ def normalize_order(row):
         "total": unit * qty,
         "qty": qty,
         "unit": unit,
-        "seller": seller,
+        "seller": buyer,
         "enchantments": enchantments,
         "demand_score": enchantment_demand_score(item, enchantments),
     }
@@ -826,53 +829,127 @@ def scan_ah_to_order(auctions, orders):
     return ideas
 
 
+def recursive_material_plan(product, recipe_map, direct_prices, memo=None, stack=None):
+    """Return the cheapest known cost and an action plan for one crafted item.
+
+    Direct materials are acquired from Shop/AH when available. If a material
+    has its own recipe, the scanner can recursively craft that intermediate.
+    This lets recipes chain instead of stopping at the first crafted ingredient.
+    """
+    memo = memo or {}
+    stack = stack or set()
+    product = normalize_recipe_item(product)
+    if product in memo:
+        return memo[product]
+    if product in stack:
+        return None
+    stack = set(stack)
+    stack.add(product)
+
+    if product in direct_prices:
+        source, price = direct_prices[product]
+        result = {
+            "cost": price,
+            "plan": [(source.upper(), product, 1, price)],
+        }
+        memo[product] = result
+        return result
+
+    recipe = recipe_map.get(product)
+    if not recipe:
+        return None
+
+    total = 0.0
+    plan = []
+    for material, count in recipe.items():
+        child = recursive_material_plan(material, recipe_map, direct_prices, memo, stack)
+        if child is None:
+            return None
+        total += child["cost"] * count
+        for source, name, qty, unit in child["plan"]:
+            plan.append((source, name, qty * count, unit))
+
+    result = {"cost": total, "plan": plan}
+    memo[product] = result
+    return result
+
+
+def format_material_plan(plan):
+    merged = {}
+    for source, item, qty, unit in plan:
+        key = (source, item, round(unit, 8))
+        merged[key] = merged.get(key, 0) + qty
+    lines = []
+    for (source, item, unit), qty in sorted(merged.items()):
+        if source == "CRAFT":
+            verb = "CRAFT"
+        elif source == "SHOP":
+            verb = "BUY FROM SHOP"
+        elif source == "AH":
+            verb = "BUY FROM AH"
+        else:
+            verb = source
+        lines.append(f"{verb}: {qty:g}x {item} at {money(unit)} each")
+    return lines
+
+
 def scan_crafting(recipes, orders, auctions, shop, sell):
     ideas = []
-    material_prices = material_unit_prices(orders, auctions, shop, sell)
+    direct_prices = {}
+    for item, listings in auctions.items():
+        if listings:
+            direct_prices[item] = ("AH", listings[0]["unit"])
+    for item, price in shop.items():
+        # Shop is normally the cleanest direct acquisition source when cheaper.
+        if item not in direct_prices or price < direct_prices[item][1]:
+            direct_prices[item] = ("SHOP", price)
 
+    memo = {}
     for product, recipe in recipes.items():
         order = orders.get(product, [None])[0]
         ah_basis = price_sample_details(auctions.get(product, [])) if auctions.get(product) else None
         exits = []
         if order:
-            exits.append(("ORDER", order["unit"], int(order["qty"]), f"fulfill {order['seller']}'s active order"))
+            exits.append(("ORDER", order["unit"], int(order["qty"]), f"craft {product.replace('_', ' ')} yourself, then fulfill {order['seller']}'s active order"))
         if ah_basis:
-            exits.append(("AH", ah_basis["target"], None, "craft, then list on AH"))
+            # Do not use an AH asking-price exit if an active order shows that
+            # buyers are nowhere near the proposed AH price.
+            best_order = order["unit"] if order else None
+            if best_order is None or ah_basis["target"] <= best_order * MAX_AH_TO_ORDER_PRICE_RATIO:
+                exits.append(("AH", ah_basis["target"], None, f"craft {product.replace('_', ' ')} yourself, then list it on AH"))
         if product in sell:
-            exits.append(("/SELL", sell[product], None, "craft, then use /sell"))
+            exits.append(("/SELL", sell[product], None, f"craft {product.replace('_', ' ')} yourself, then use /sell"))
 
         if not exits:
             continue
 
-        unit_cost = 0.0
-        breakdown = []
-        possible = True
-        for material, count in recipe.items():
-            price = material_prices.get(material)
-            if price is None:
-                possible = False
-                break
-            unit_cost += price * count
-            breakdown.append(f"{int(count) if float(count).is_integer() else count:g}x {material} at {money(price)} each")
-        if not possible or unit_cost <= 0:
+        plan = recursive_material_plan(product, recipes, direct_prices, memo={})
+        if plan is None or plan["cost"] <= 0:
             continue
 
         for exit_type, exit_price, order_qty, note in exits:
-            if exit_price <= unit_cost:
+            if exit_price <= plan["cost"]:
                 continue
             if exit_type == "ORDER":
                 qty = order_qty
             elif BUDGET > 0:
-                qty = int(BUDGET // unit_cost)
+                qty = int(BUDGET // plan["cost"])
             else:
                 qty = 1
             if qty <= 0:
                 continue
+
+            full_plan = [(source, item, item_qty * qty, unit) for source, item, item_qty, unit in plan["plan"]]
             idea = make_opportunity(
-                f"CRAFT -> {exit_type}", product, unit_cost, qty, exit_price,
-                "Market materials", note,
+                f"CRAFT -> {exit_type}", product, plan["cost"], qty, exit_price,
+                "Recipe materials", note,
                 sell_basis=ah_basis if exit_type == "AH" else None,
-                extra={"recipe": recipe, "recipe_breakdown": breakdown}
+                extra={
+                    "recipe": recipe,
+                    "recipe_breakdown": format_material_plan(full_plan),
+                    "action_plan": full_plan,
+                    "craft_required": True,
+                }
             )
             if idea:
                 ideas.append(idea)
@@ -880,39 +957,14 @@ def scan_crafting(recipes, orders, auctions, shop, sell):
 
 
 def scan_order_to_ah(orders, auctions):
-    ideas = []
-    for item, order_list in orders.items():
-        ah = auctions.get(item, [])
-        for order in order_list[:3]:
-            # Match an order to the same enchantment set when possible.
-            basis = price_sample_details(ah, target_listing=order)
-            if basis is None:
-                # For orders without enchantment metadata, fall back to the
-                # base item market only. This avoids pretending enchanted and
-                # unenchanted gear are equivalent.
-                if order.get("enchantments"):
-                    continue
-                basis = price_sample_details(ah)
-            if basis is None:
-                continue
+    """Disabled intentionally. An active Order is a BUYER, not a source.
 
-            exit_price = basis["target"]
-            qty = order["qty"]
-            idea = make_opportunity(
-                "ORDER -> AH",
-                item,
-                order["unit"],
-                qty,
-                exit_price,
-                order["seller"],
-                f"buy up to {int(qty)} available item(s) from {order['seller']}",
-                sell_basis=basis,
-            )
-            if idea:
-                idea["enchantments"] = order.get("enchantments", ())
-                idea["demand_score"] = enchantment_demand_score(item, idea["enchantments"])
-                ideas.append(idea)
-    return ideas
+    The old scanner incorrectly treated an order price as a price we could
+    buy from, producing nonsense alerts such as "buy 300,000 bamboo at 0.00".
+    Use SHOP -> ORDER, AH -> ORDER, /SELL -> ORDER, or CRAFT -> ORDER instead.
+    """
+    return []
+
 
 def scan_ah_flip(auctions):
     ideas = []
@@ -929,6 +981,11 @@ def scan_ah_flip(auctions):
         exit_price = basis["target"]
         if exit_price <= cheapest["unit"]:
             continue
+        # If an active player order exists and is far below the proposed AH
+        # price, do not claim the AH price is realistic.
+        # This prevents cases like AH ~1,500 while buyers are only offering ~77.
+        # The caller does not have orders here, so this guard is applied later
+        # through the order-aware scan instead.
 
         idea = make_opportunity(
             "AH -> AH",
@@ -948,6 +1005,28 @@ def scan_ah_flip(auctions):
             idea["demand_score"] = cheapest.get("demand_score", 0.0)
             ideas.append(idea)
     return ideas
+
+def filter_unrealistic_ah_exits(ideas, orders):
+    """Reject AH exits whose asking price is far above active buyer orders."""
+    filtered = []
+    for idea in ideas:
+        if idea.get("kind") not in {"AH -> AH", "ORDER -> AH", "CRAFT -> AH"}:
+            filtered.append(idea)
+            continue
+        item_orders = orders.get(idea["item"], [])
+        if not item_orders:
+            filtered.append(idea)
+            continue
+        best_order = max((o["unit"] for o in item_orders), default=0)
+        if best_order <= 0 or idea["sell_unit"] <= best_order * MAX_AH_TO_ORDER_PRICE_RATIO:
+            filtered.append(idea)
+        else:
+            print(
+                f"Rejected unrealistic AH exit for {idea['item']}: "
+                f"scanner AH={idea['sell_unit']:.2f}, best order={best_order:.2f}."
+            )
+    return filtered
+
 
 def scan_budget(ideas):
     if BUDGET <= 0:
@@ -1018,18 +1097,36 @@ def format_alert(ideas, data_sources=None):
         lines.extend([f"DEAL {i}: {x['item'].upper()}", f"METHOD: {x['kind']}", ""])
 
         if x.get("recipe"):
-            lines.extend(["RECIPE:"])
-            lines.extend(f"- {part}" for part in x.get("recipe_breakdown", []))
-            lines.append(f"TOTAL MATERIAL COST PER CRAFTED ITEM: {money(x['buy_unit'])} coins")
+            lines.extend([
+                "ACTION PLAN:",
+                "1. Get the required materials using the sources below.",
+            ])
+            lines.extend(f"   - {part}" for part in x.get("recipe_breakdown", []))
+            lines.append("2. CRAFT the finished item yourself using the recipe.")
+            lines.append(f"3. Cost to produce ONE finished item: {money(x['buy_unit'])} coins.")
             lines.append("")
 
+        if x.get("craft_required"):
+            lines.extend([
+                f"STEP 1 — GET MATERIALS: follow the material plan above.",
+                f"TOTAL MATERIAL SPEND: {money(x['buy_total'])} coins.",
+                "",
+                f"STEP 2 — CRAFT: make {x['qty']} {x['item'].replace('_', ' ')} yourself.",
+                "",
+                f"STEP 3 — SELL: {x['qty']} item(s) for about {money(x['sell_unit'])} coins each.",
+                f"ESTIMATED SALES REVENUE: {money(x['revenue'])} coins.",
+            ])
+        else:
+            lines.extend([
+                f"STEP 1 — BUY: {x['qty']} item(s) at {money(x['buy_unit'])} coins each.",
+                f"TOTAL TO SPEND: {money(x['buy_total'])} coins.",
+                f"SOURCE: {x['source']}.",
+                "",
+                f"STEP 2 — SELL: {x['qty']} item(s) for about {money(x['sell_unit'])} coins each.",
+                f"ESTIMATED SALES REVENUE: {money(x['revenue'])} coins.",
+            ])
+
         lines.extend([
-            f"STEP 1 — BUY/MAKE: {x['qty']} item(s) at {money(x['buy_unit'])} coins each.",
-            f"TOTAL TO SPEND: {money(x['buy_total'])} coins.",
-            f"SOURCE: {x['source']}.",
-            "",
-            f"STEP 2 — SELL: {x['qty']} item(s) for about {money(x['sell_unit'])} coins each.",
-            f"ESTIMATED SALES REVENUE: {money(x['revenue'])} coins.",
             "",
             f"ESTIMATED PROFIT: {money(x['profit'])} coins.",
             f"RETURN ON MONEY SPENT: {x['roi'] * 100:.1f}%.",
@@ -1061,6 +1158,8 @@ def format_alert(ideas, data_sources=None):
             f"WHAT TO DO: {x['note'].capitalize()}.",
             "",
             "IMPORTANT: An AH asking price is not a guaranteed sale. Active Orders are checked separately.",
+            "For crafting deals, the scanner does NOT assume mining/farming is free. It only counts materials with a known Shop/AH acquisition price.",
+            "If you already own the materials, your real cash cost can be lower; if you must mine/farm them yourself, treat that as your time cost.",
             "Check the live market before buying because another player can change the price.",
             "",
             "------------------------------",
@@ -1145,6 +1244,7 @@ def run_once():
     # the optional endpoint returned a malformed/partial recipe map.
     ideas.extend(scan_crafting(RECIPES, orders, auctions, shop, sell))
 
+    ideas = filter_unrealistic_ah_exits(ideas, orders)
     ideas = scan_budget(ideas)
     ideas = dedupe_and_rank(ideas)
 
