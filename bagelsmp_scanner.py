@@ -695,6 +695,68 @@ def parse_price_map(data, kind):
     return result
 
 
+def parse_market_price_map(data):
+    """Extract a conservative per-item market/sold-price signal from prices data.
+
+    This is deliberately separate from AH asking prices. A current AH listing
+    is not evidence that somebody will actually pay that amount. The scanner
+    uses this map as a sanity check for AH exits.
+    """
+    result = {}
+    for raw in extract_rows(data):
+        if not isinstance(raw, dict):
+            continue
+        item = normalize_name(raw)
+        if not item:
+            continue
+
+        # Prefer fields that explicitly describe sold/market prices.
+        value = num(first_value(raw, [
+            "market_price", "marketPrice", "median_price", "medianPrice",
+            "average_price", "averagePrice", "price_7d", "price7d",
+            "seven_day_price", "price_24h", "price24h",
+            "last_sale_price", "lastSalePrice", "sold_price", "soldPrice",
+            "sale_price", "salePrice", "last_price", "lastPrice",
+        ]))
+
+        # If the API gives an explicit total + quantity, normalize it.
+        if value is None:
+            total = num(first_value(raw, ["total_price", "totalPrice", "total", "sales_total"]))
+            qty = num(first_value(raw, ["quantity", "qty", "amount", "count"]), 1) or 1
+            if total is not None and total > 0 and qty > 0:
+                value = total / qty
+
+        # Finally accept a generic price from the prices endpoint as a
+        # per-item market value. Do NOT divide it merely because a quantity
+        # field exists; prices are normally already quoted per item.
+        if value is None:
+            value = num(first_value(raw, ["price", "value"]))
+
+        if value is not None and value > 0:
+            result[item] = value
+
+    if isinstance(data, dict):
+        for key, raw in data.items():
+            item = normalize_recipe_item(key)
+            if not item or not isinstance(raw, (dict, int, float, str)) or isinstance(raw, bool):
+                continue
+            if isinstance(raw, dict):
+                value = num(first_value(raw, [
+                    "market_price", "marketPrice", "median_price", "medianPrice",
+                    "average_price", "averagePrice", "price_7d", "price7d",
+                    "seven_day_price", "price_24h", "price24h",
+                    "last_sale_price", "lastSalePrice", "sold_price", "soldPrice",
+                    "sale_price", "salePrice", "last_price", "lastPrice", "price", "value"
+                ]))
+                if value is not None and value > 0:
+                    result[item] = value
+            else:
+                value = num(raw)
+                if value is not None and value > 0:
+                    result[item] = value
+    return result
+
+
 def normalize_recipe_item(value):
     return text(value).lower().replace("minecraft:", "").replace(" ", "_").strip()
 
@@ -893,7 +955,7 @@ def format_material_plan(plan):
     return lines
 
 
-def scan_crafting(recipes, orders, auctions, shop, sell):
+def scan_crafting(recipes, orders, auctions, shop, sell, market_prices):
     ideas = []
     direct_prices = {}
     for item, listings in auctions.items():
@@ -908,15 +970,18 @@ def scan_crafting(recipes, orders, auctions, shop, sell):
     for product, recipe in recipes.items():
         order = orders.get(product, [None])[0]
         ah_basis = price_sample_details(auctions.get(product, [])) if auctions.get(product) else None
+        market_price = market_prices.get(product)
         exits = []
         if order:
             exits.append(("ORDER", order["unit"], int(order["qty"]), f"craft {product.replace('_', ' ')} yourself, then fulfill {order['seller']}'s active order"))
-        if ah_basis:
-            # Do not use an AH asking-price exit if an active order shows that
-            # buyers are nowhere near the proposed AH price.
+        if ah_basis and market_price is not None and market_price > 0:
+            # AH asking prices are not treated as proof of demand. Cap the
+            # exit using the market/sold-price signal and reject it if an
+            # active order is dramatically lower.
+            ah_exit = min(ah_basis["target"], market_price * 1.05)
             best_order = order["unit"] if order else None
-            if best_order is None or ah_basis["target"] <= best_order * MAX_AH_TO_ORDER_PRICE_RATIO:
-                exits.append(("AH", ah_basis["target"], None, f"craft {product.replace('_', ' ')} yourself, then list it on AH"))
+            if best_order is None or ah_exit <= best_order * MAX_AH_TO_ORDER_PRICE_RATIO:
+                exits.append(("AH", ah_exit, None, f"craft {product.replace('_', ' ')} yourself, then list it on AH; exit price is supported by market/sold data"))
         if product in sell:
             exits.append(("/SELL", sell[product], None, f"craft {product.replace('_', ' ')} yourself, then use /sell"))
 
@@ -966,10 +1031,21 @@ def scan_order_to_ah(orders, auctions):
     return []
 
 
-def scan_ah_flip(auctions):
+def scan_ah_flip(auctions, market_prices, shop=None):
+    """Find AH -> AH flips only when sold/market data supports the exit.
+
+    Active listings alone are not enough. A seller can list an item at an
+    absurd price and nobody may buy it. We therefore require a market/sold
+    price signal from the prices endpoint and cap the proposed exit using it.
+    """
     ideas = []
     for item, listings in auctions.items():
         if len(listings) < PRICE_SAMPLE_SIZE:
+            continue
+
+        market_price = market_prices.get(item)
+        if market_price is None or market_price <= 0:
+            # No sold/market evidence = no AH -> AH alert.
             continue
 
         listings = sorted(listings, key=lambda x: x["unit"])
@@ -978,14 +1054,19 @@ def scan_ah_flip(auctions):
         if basis is None:
             continue
 
-        exit_price = basis["target"]
+        # Never assume we can sell above the proven market price merely
+        # because current asking prices are high. Allow a small 5% cushion.
+        exit_price = min(basis["target"], market_price * 1.05)
+
+        # If the server shop sells this exact item, that shop price is a hard
+        # ceiling for an AH resale assumption. A buyer can always obtain the
+        # item from the server shop, so a wildly higher AH asking price is not
+        # evidence that a player will pay it.
+        shop_price = (shop or {}).get(item)
+        if shop_price is not None and shop_price > 0:
+            exit_price = min(exit_price, shop_price)
         if exit_price <= cheapest["unit"]:
             continue
-        # If an active player order exists and is far below the proposed AH
-        # price, do not claim the AH price is realistic.
-        # This prevents cases like AH ~1,500 while buyers are only offering ~77.
-        # The caller does not have orders here, so this guard is applied later
-        # through the order-aware scan instead.
 
         idea = make_opportunity(
             "AH -> AH",
@@ -994,11 +1075,13 @@ def scan_ah_flip(auctions):
             cheapest["qty"],
             exit_price,
             cheapest["seller"],
-            "buy the cheapest full listing and relist its actual quantity" + (
-                f"; durability {cheapest['durability_percent']:.0f}%"
-                if cheapest.get("durability_percent") is not None else ""
-            ),
+            "buy the cheapest full listing and relist its actual quantity; the sell price is capped by recent/market-price evidence",
             sell_basis=basis,
+            extra={
+                "market_price": market_price,
+                "market_supported_sell": True,
+                "shop_price": shop_price,
+            },
         )
         if idea:
             idea["enchantments"] = cheapest.get("enchantments", ())
@@ -1006,25 +1089,50 @@ def scan_ah_flip(auctions):
             ideas.append(idea)
     return ideas
 
-def filter_unrealistic_ah_exits(ideas, orders):
-    """Reject AH exits whose asking price is far above active buyer orders."""
+
+def filter_unrealistic_ah_exits(ideas, orders, market_prices, shop):
+    """Reject AH exits that lack buyer/sold-price support."""
     filtered = []
     for idea in ideas:
-        if idea.get("kind") not in {"AH -> AH", "ORDER -> AH", "CRAFT -> AH"}:
+        if idea.get("kind") not in {"AH -> AH", "CRAFT -> AH"}:
             filtered.append(idea)
             continue
-        item_orders = orders.get(idea["item"], [])
-        if not item_orders:
-            filtered.append(idea)
-            continue
+
+        item = idea["item"]
+        market_price = market_prices.get(item)
+        item_orders = orders.get(item, [])
         best_order = max((o["unit"] for o in item_orders), default=0)
-        if best_order <= 0 or idea["sell_unit"] <= best_order * MAX_AH_TO_ORDER_PRICE_RATIO:
-            filtered.append(idea)
-        else:
+
+        # For AH exits, require either market/sold evidence or a real active
+        # order. The current scanner only creates AH exits with market data,
+        # but this second guard protects against malformed API data.
+        if market_price is None or market_price <= 0:
+            print(f"Rejected AH exit for {item}: no sold/market price evidence.")
+            continue
+
+        if idea["sell_unit"] > market_price * 1.05:
             print(
-                f"Rejected unrealistic AH exit for {idea['item']}: "
+                f"Rejected unrealistic AH exit for {item}: "
+                f"scanner AH={idea['sell_unit']:.2f}, market={market_price:.2f}."
+            )
+            continue
+
+        if best_order > 0 and idea["sell_unit"] > best_order * MAX_AH_TO_ORDER_PRICE_RATIO:
+            print(
+                f"Rejected AH exit for {item}: "
                 f"scanner AH={idea['sell_unit']:.2f}, best order={best_order:.2f}."
             )
+            continue
+
+        shop_price = shop.get(item)
+        if shop_price is not None and shop_price > 0 and idea["sell_unit"] > shop_price + 1e-9:
+            print(
+                f"Rejected AH exit for {item}: "
+                f"scanner AH={idea['sell_unit']:.2f} exceeds server shop price={shop_price:.2f}."
+            )
+            continue
+
+        filtered.append(idea)
     return filtered
 
 
@@ -1079,7 +1187,7 @@ def money(value):
 
 def format_alert(ideas, data_sources=None):
     lines = [
-        "BAGEL SMP — DEAL FOUND",
+        "BAGEL SMP 鈥� DEAL FOUND",
         "",
         f"Your budget: {money(BUDGET) if BUDGET > 0 else 'No limit'} coins",
         "",
@@ -1108,21 +1216,21 @@ def format_alert(ideas, data_sources=None):
 
         if x.get("craft_required"):
             lines.extend([
-                f"STEP 1 — GET MATERIALS: follow the material plan above.",
+                f"STEP 1 鈥� GET MATERIALS: follow the material plan above.",
                 f"TOTAL MATERIAL SPEND: {money(x['buy_total'])} coins.",
                 "",
-                f"STEP 2 — CRAFT: make {x['qty']} {x['item'].replace('_', ' ')} yourself.",
+                f"STEP 2 鈥� CRAFT: make {x['qty']} {x['item'].replace('_', ' ')} yourself.",
                 "",
-                f"STEP 3 — SELL: {x['qty']} item(s) for about {money(x['sell_unit'])} coins each.",
+                f"STEP 3 鈥� SELL: {x['qty']} item(s) for about {money(x['sell_unit'])} coins each.",
                 f"ESTIMATED SALES REVENUE: {money(x['revenue'])} coins.",
             ])
         else:
             lines.extend([
-                f"STEP 1 — BUY: {x['qty']} item(s) at {money(x['buy_unit'])} coins each.",
+                f"STEP 1 鈥� BUY: {x['qty']} item(s) at {money(x['buy_unit'])} coins each.",
                 f"TOTAL TO SPEND: {money(x['buy_total'])} coins.",
                 f"SOURCE: {x['source']}.",
                 "",
-                f"STEP 2 — SELL: {x['qty']} item(s) for about {money(x['sell_unit'])} coins each.",
+                f"STEP 2 鈥� SELL: {x['qty']} item(s) for about {money(x['sell_unit'])} coins each.",
                 f"ESTIMATED SALES REVENUE: {money(x['revenue'])} coins.",
             ])
 
@@ -1140,6 +1248,17 @@ def format_alert(ideas, data_sources=None):
             ])
 
         basis = x.get("sell_basis", {})
+        if x.get("market_price"):
+            lines.extend([
+                f"SOLD/MARKET PRICE CHECK: {money(x['market_price'])} coins each.",
+                "The scanner will not use a much higher AH asking price as the expected sale price.",
+            ])
+        if x.get("shop_price"):
+            lines.append(
+                f"SERVER SHOP PRICE: {money(x['shop_price'])} coins each. "
+                "This is the maximum AH resale price the scanner will assume when the item is available in the server shop."
+            )
+
         if basis.get("sample"):
             sample_text = ", ".join(
                 f"{int(round(s['qty']))} for {money(s['total'])} ({money(s['unit'])}/each)"
@@ -1149,7 +1268,8 @@ def format_alert(ideas, data_sources=None):
                 "",
                 f"AH PRICE CHECK: {sample_text}.",
                 f"AVERAGE OF THE 5 CHEAPEST COMPARABLE LISTINGS: {money(basis['average'])} coins each.",
-                f"SCANNER SELL PRICE: {money(basis['target'])} coins each.",
+                f"RAW 5-LISTING UNDERCUT PRICE: {money(basis['target'])} coins each.",
+                f"ACTUAL SCANNER SELL PRICE USED: {money(x['sell_unit'])} coins each.",
                 f"COMPARABLE LISTINGS FOUND: {basis.get('comparable_count', len(basis['sample']))}.",
             ])
 
@@ -1203,7 +1323,7 @@ def run_once():
 
     if prices_raw is None or orders_raw is None or auctions_raw is None:
         send_discord(
-            "BAGEL SMP — SCANNER ERROR\n"
+            "BAGEL SMP 鈥� SCANNER ERROR\n"
             "The core market data could not be checked completely. "
             "No buying decision should be made from this scan. "
             "Check the GitHub Actions log for the HTTP status."
@@ -1226,6 +1346,7 @@ def run_once():
     auctions = build_auction_book(auctions_raw)
     orders = build_orders(orders_raw)
     raw_prices = prices_raw if isinstance(prices_raw, dict) else {}
+    market_prices = parse_market_price_map(prices_raw)
     shop = parse_price_map(shop_raw, "shop") if shop_raw is not None else {}
     sell = parse_price_map(sell_raw, "sell") if sell_raw is not None else {}
     if sell and SELL_MULTIPLIER != 1.0:
@@ -1234,17 +1355,17 @@ def run_once():
 
     ideas = []
     ideas.extend(scan_order_to_ah(orders, auctions))
-    ideas.extend(scan_ah_flip(auctions))
+    ideas.extend(scan_ah_flip(auctions, market_prices, shop))
     ideas.extend(scan_shop_to_order(shop, orders))
     ideas.extend(scan_sell_to_order(sell, orders))
     ideas.extend(scan_shop_to_sell(shop, sell))
     ideas.extend(scan_ah_to_order(auctions, orders))
-    ideas.extend(scan_crafting(recipes, orders, auctions, shop, sell))
+    ideas.extend(scan_crafting(recipes, orders, auctions, shop, sell, market_prices))
     # Keep the existing crafting path for the original hard-coded recipes if
     # the optional endpoint returned a malformed/partial recipe map.
-    ideas.extend(scan_crafting(RECIPES, orders, auctions, shop, sell))
+    ideas.extend(scan_crafting(RECIPES, orders, auctions, shop, sell, market_prices))
 
-    ideas = filter_unrealistic_ah_exits(ideas, orders)
+    ideas = filter_unrealistic_ah_exits(ideas, orders, market_prices, shop)
     ideas = scan_budget(ideas)
     ideas = dedupe_and_rank(ideas)
 
@@ -1259,7 +1380,7 @@ def run_once():
     print(
         f"Market data: {len(auctions)} auction items, {len(orders)} order items, "
         f"{len(shop)} shop prices, {len(sell)} /sell prices, "
-        f"{len(recipes)} recipes, {len(ideas)} opportunities."
+        f"{len(recipes)} recipes, {len(market_prices)} sold/market prices, {len(ideas)} opportunities."
     )
 
     if ideas:
@@ -1272,7 +1393,7 @@ def run_once():
             print("Same opportunities as previous scan; Discord alert suppressed.")
     elif HEARTBEAT:
         send_discord(
-            "BAGEL SMP — NO DEAL FOUND\n"
+            "BAGEL SMP 鈥� NO DEAL FOUND\n"
             "I checked the available market sources successfully. There is currently "
             "no deal that meets both the minimum profit and ROI requirements.\n\n"
             f"Your budget: {money(BUDGET) if BUDGET > 0 else 'No limit'} coins.\n"
@@ -1310,7 +1431,7 @@ def main():
         except Exception as exc:
             print(f"Unexpected scan error: {exc}")
             send_discord(
-                "BAGEL SMP — SCANNER ERROR\n"
+                "BAGEL SMP 鈥� SCANNER ERROR\n"
                 f"The scanner hit an unexpected error: {type(exc).__name__}. "
                 "It will try again on the next scan."
             )
